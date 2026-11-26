@@ -1,6 +1,6 @@
 -- ============================================================================
 -- BASE DE DATOS TRANSACCIONAL DE MUSICOTERAPIA - ALZHEIMER (SQL SERVER)
--- Versión rediseñada definitiva: 31 tablas (4 RBAC/Personal + 27 Operativas)
+-- Versión rediseñada definitiva: 30 tablas (4 RBAC/Personal + 26 Operativas)
 -- Cubre: 7 KPIs, RP01-RP04, FR01-FR08, HIBRIDO vs SINTETICO_IA y 4 Roles
 -- ============================================================================
 -- NOTA PARA AZURE SQL:
@@ -93,6 +93,7 @@ CREATE TABLE paciente (
     id_paciente BIGINT IDENTITY(1,1) PRIMARY KEY,
     codigo_paciente NVARCHAR(60) NOT NULL UNIQUE,
     sexo NVARCHAR(20) NULL,                       -- MASCULINO | FEMENINO | NO_ESPECIFICADO
+    estado_seguimiento NVARCHAR(30) NOT NULL DEFAULT 'ACTIVO', -- ACTIVO | EGRESADO | SUSPENDIDO
     fecha_ingreso_programa DATE NOT NULL,
     fecha_salida_programa DATE NULL,
     escenario NVARCHAR(30) NOT NULL DEFAULT 'HIBRIDO', -- HIBRIDO | SINTETICO_IA
@@ -298,7 +299,7 @@ GO
 
 
 -- ============================================================================
--- BLOQUE 4: INTERVENCIÓN MUSICAL, EVALUACIONES Y AGITACIÓN (Tablas 23 a 31)
+-- BLOQUE 4: INTERVENCIÓN MUSICAL, EVALUACIONES Y AGITACIÓN (Tablas 23 a 30)
 -- ============================================================================
 
 -- 23. SESION MUSICAL (FR02 y FR03)
@@ -451,34 +452,6 @@ CREATE TABLE agitacion_turno (
 );
 GO
 
--- 31. CONTROL SEMANAL DE INTERVENCION (FR04 y denominador de KPI 4)
--- Los totales de sesiones y minutos se calculan desde participacion_sesion.
--- Sin una ficha confirmada no se infiere que un paciente estuvo en intervencion.
-CREATE TABLE control_semanal_intervencion (
-    id_control_semanal BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
-    id_paciente BIGINT NOT NULL,
-    fecha_inicio_semana DATE NOT NULL,
-    codigo_programa NVARCHAR(50) NOT NULL DEFAULT N'MUSICOTERAPIA',
-    en_intervencion BIT NOT NULL,
-    cobertura_registro NVARCHAR(20) NULL, -- COMPLETA | INSUFICIENTE | CERO_CONFIRMADO
-    codigo_responsable NVARCHAR(50) NOT NULL,
-    observaciones NVARCHAR(500) NULL,
-    fecha_actualizacion_utc DATETIME2(0) NOT NULL DEFAULT SYSUTCDATETIME(),
-    CONSTRAINT FK_fr04_paciente FOREIGN KEY (id_paciente) REFERENCES paciente(id_paciente),
-    CONSTRAINT FK_fr04_responsable FOREIGN KEY (codigo_responsable) REFERENCES usuario_sistema(codigo_personal),
-    CONSTRAINT UQ_fr04_paciente_semana_programa UNIQUE (id_paciente, fecha_inicio_semana, codigo_programa),
-    CONSTRAINT CHK_fr04_lunes CHECK (
-        DATEDIFF(day, CONVERT(date, '19000101', 112), fecha_inicio_semana) % 7 = 0
-    ),
-    CONSTRAINT CHK_fr04_cobertura CHECK (
-        (en_intervencion = 0 AND cobertura_registro IS NULL)
-        OR (en_intervencion = 1 AND cobertura_registro IN
-            (N'COMPLETA', N'INSUFICIENTE', N'CERO_CONFIRMADO'))
-    ),
-    CONSTRAINT CHK_fr04_responsable CHECK (LEN(LTRIM(RTRIM(codigo_responsable))) > 0)
-);
-GO
-
 
 -- ============================================================================
 -- BLOQUE 5: ÍNDICES ESTRATÉGICOS PARA CONSULTAS Y ETL HACIA DATA MART
@@ -492,7 +465,6 @@ CREATE INDEX IX_expo_participacion ON exposicion_musical(id_participacion_sesion
 CREATE INDEX IX_eval_paciente_fecha ON evaluacion_paciente(id_paciente, fecha_hora_evaluacion) INCLUDE (momento_evaluacion, condicion_evaluada, id_evaluador);
 CREATE INDEX IX_reseval_inst_eval ON resultado_evaluacion(id_instrumento_evaluacion, id_evaluacion_paciente) INCLUDE (puntuacion_obtenida, estado_puntaje);
 CREATE INDEX IX_agiturno_paciente_fecha ON agitacion_turno(id_paciente, fecha_turno) INCLUDE (tipo_turno, cobertura_observacion, total_episodios, id_responsable);
-CREATE INDEX IX_fr04_semana_programa ON control_semanal_intervencion(fecha_inicio_semana, codigo_programa, en_intervencion) INCLUDE (cobertura_registro);
 GO
 
 
