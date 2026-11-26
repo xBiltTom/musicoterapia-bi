@@ -3,6 +3,9 @@
 Todas reciben parametros posicionales. No se crean vistas, tablas ni data marts.
 """
 
+from collections import Counter, defaultdict
+from contextlib import closing
+
 SCENARIOS = """
 SELECT escenario, COUNT_BIG(*) AS pacientes
 FROM dbo.paciente
@@ -10,94 +13,99 @@ GROUP BY escenario
 ORDER BY escenario
 """
 
-K1 = """
-SELECT
-    SUM(CASE WHEN ps.experiencia_sesion = 'POSITIVA' THEN 1 ELSE 0 END) AS positivas,
-    SUM(CASE WHEN ps.experiencia_sesion = 'NEUTRA' THEN 1 ELSE 0 END) AS neutras,
-    SUM(CASE WHEN ps.experiencia_sesion = 'NEGATIVA' THEN 1 ELSE 0 END) AS negativas,
-    COUNT_BIG(*) AS participaciones_validas
-FROM dbo.participacion_sesion AS ps
-JOIN dbo.paciente AS p ON p.id_paciente = ps.id_paciente
-JOIN dbo.sesion_musical AS s ON s.id_sesion_musical = ps.id_sesion_musical
-WHERE p.escenario = ?
-  AND s.fecha_hora_inicio_sesion >= ?
-  AND s.fecha_hora_inicio_sesion < DATEADD(day, 1, CAST(? AS date))
-  AND ps.experiencia_sesion IN ('POSITIVA', 'NEUTRA', 'NEGATIVA')
-"""
-
-K1_MONTHLY = """
-SELECT
-    CONVERT(char(7), s.fecha_hora_inicio_sesion, 120) AS mes,
-    SUM(CASE WHEN ps.experiencia_sesion = 'POSITIVA' THEN 1 ELSE 0 END) AS positivas,
-    COUNT_BIG(*) AS participaciones_validas
-FROM dbo.participacion_sesion AS ps
-JOIN dbo.paciente AS p ON p.id_paciente = ps.id_paciente
-JOIN dbo.sesion_musical AS s ON s.id_sesion_musical = ps.id_sesion_musical
-WHERE p.escenario = ?
-  AND s.fecha_hora_inicio_sesion >= ?
-  AND s.fecha_hora_inicio_sesion < DATEADD(day, 1, CAST(? AS date))
-  AND ps.experiencia_sesion IN ('POSITIVA', 'NEUTRA', 'NEGATIVA')
-GROUP BY CONVERT(char(7), s.fecha_hora_inicio_sesion, 120)
-ORDER BY mes
-"""
+def scenario_patients(conn, scenario):
+    with closing(conn.cursor()) as cursor:
+        cursor.execute("SELECT id_paciente FROM dbo.paciente WHERE escenario = ?", scenario)
+        return {row[0] for row in cursor.fetchall()}
 
 
-def paired_score_query(instrument: str, min_score: int, max_score: int, crossed: bool = False) -> str:
-    """Primera evaluacion inicial y ultimo seguimiento valido en el periodo."""
-    extra = (
-        ", SUM(CASE WHEN basal.puntuacion > 10 THEN 1 ELSE 0 END) AS basales_sobre_corte"
-        ", SUM(CASE WHEN basal.puntuacion > 10 AND seguimiento.puntuacion <= 10 "
-        "THEN 1 ELSE 0 END) AS cruces_corte"
-        if crossed
-        else ", SUM(CASE WHEN basal.puntuacion - seguimiento.puntuacion >= 6 "
-        "THEN 1 ELSE 0 END) AS respondedores"
-    )
-    return f"""
-WITH basal AS (
-    SELECT e.id_paciente, e.fecha_hora_evaluacion AS fecha,
-           r.puntuacion_obtenida AS puntuacion,
-           ROW_NUMBER() OVER (
-               PARTITION BY e.id_paciente
-               ORDER BY e.fecha_hora_evaluacion, e.id_evaluacion_paciente
-           ) AS orden
-    FROM dbo.evaluacion_paciente AS e
-    JOIN dbo.resultado_evaluacion AS r
-      ON r.id_evaluacion_paciente = e.id_evaluacion_paciente
-    JOIN dbo.instrumento_evaluacion AS i
-      ON i.id_instrumento_evaluacion = r.id_instrumento_evaluacion
-    JOIN dbo.paciente AS p ON p.id_paciente = e.id_paciente
-    WHERE p.escenario = ? AND i.codigo_instrumento = '{instrument}'
-      AND e.momento_evaluacion = 'INICIAL'
-      AND e.fecha_hora_evaluacion < DATEADD(day, 1, CAST(? AS date))
-      AND r.puntuacion_obtenida BETWEEN {min_score} AND {max_score}
-), seguimiento AS (
-    SELECT e.id_paciente, e.fecha_hora_evaluacion AS fecha,
-           r.puntuacion_obtenida AS puntuacion,
-           ROW_NUMBER() OVER (
-               PARTITION BY e.id_paciente
-               ORDER BY e.fecha_hora_evaluacion DESC, e.id_evaluacion_paciente DESC
-           ) AS orden
-    FROM dbo.evaluacion_paciente AS e
-    JOIN dbo.resultado_evaluacion AS r
-      ON r.id_evaluacion_paciente = e.id_evaluacion_paciente
-    JOIN dbo.instrumento_evaluacion AS i
-      ON i.id_instrumento_evaluacion = r.id_instrumento_evaluacion
-    JOIN dbo.paciente AS p ON p.id_paciente = e.id_paciente
-    WHERE p.escenario = ? AND i.codigo_instrumento = '{instrument}'
-      AND e.momento_evaluacion = 'SEGUIMIENTO'
-      AND e.fecha_hora_evaluacion >= ?
-      AND e.fecha_hora_evaluacion < DATEADD(day, 1, CAST(? AS date))
-      AND r.puntuacion_obtenida BETWEEN {min_score} AND {max_score}
-)
-SELECT COUNT_BIG(*) AS pacientes_con_par,
-       AVG(CAST(basal.puntuacion - seguimiento.puntuacion AS float)) AS reduccion_promedio
-       {extra}
-FROM basal
-JOIN seguimiento ON seguimiento.id_paciente = basal.id_paciente
-WHERE basal.orden = 1 AND seguimiento.orden = 1
-  AND basal.fecha < seguimiento.fecha
-"""
+def monthly_experience(conn, patients, start, end):
+    """Agrupa K1 sin ejecutar la unión masiva de tres tablas en SQL Server Express."""
+    counts = defaultdict(Counter)
+    with closing(conn.cursor()) as cursor:
+        cursor.execute("""
+            SELECT id_sesion_musical, CONVERT(char(7), fecha_hora_inicio_sesion, 120)
+            FROM dbo.sesion_musical
+            WHERE fecha_hora_inicio_sesion >= ? AND fecha_hora_inicio_sesion < DATEADD(day, 1, CAST(? AS date))
+        """, start, end)
+        months = {row[0]: row[1] for row in cursor.fetchall()}
+        if not months:
+            return []
+        cursor.execute("""
+            SELECT id_sesion_musical, id_paciente, experiencia_sesion
+            FROM dbo.participacion_sesion
+            WHERE experiencia_sesion IN ('POSITIVA', 'NEUTRA', 'NEGATIVA')
+        """)
+        while batch := cursor.fetchmany(8_192):
+            for session_id, patient_id, experience in batch:
+                month = months.get(session_id)
+                if month and patient_id in patients:
+                    counts[month][experience.strip().upper()] += 1
+
+    return [{"mes": month, "positivas": values["POSITIVA"], "neutras": values["NEUTRA"],
+             "negativas": values["NEGATIVA"], "participaciones_validas": sum(values.values())}
+            for month, values in sorted(counts.items())]
 
 
-K2 = paired_score_query("CMAI", 29, 203)
-K3 = paired_score_query("CSDD", 0, 38, crossed=True)
+def summarize_scores(initial, followup):
+    count = 0
+    total = 0
+    responders = 0
+    above_cut = 0
+    crossings = 0
+    for patient, (baseline_order, baseline_score) in initial.items():
+        latest = followup.get(patient)
+        if latest is None or baseline_order[0] >= latest[0][0]:
+            continue
+        score = latest[1]
+        change = baseline_score - score
+        count += 1
+        total += change
+        responders += change >= 6
+        above_cut += baseline_score > 10
+        crossings += baseline_score > 10 and score <= 10
+    return {"pacientes_con_par": count, "reduccion_promedio": float(total / count) if count else None,
+            "respondedores": responders, "basales_sobre_corte": above_cut, "cruces_corte": crossings}
+
+
+def paired_scores(conn, patients, start, end):
+    """Compara el primer basal válido con el último seguimiento del periodo."""
+    ranges = {"CMAI": (29, 203), "CSDD": (0, 38)}
+    initial = {code: {} for code in ranges}
+    followup = {code: {} for code in ranges}
+    with closing(conn.cursor()) as cursor:
+        cursor.execute("""SELECT id_instrumento_evaluacion, codigo_instrumento
+                          FROM dbo.instrumento_evaluacion WHERE codigo_instrumento IN ('CMAI', 'CSDD')""")
+        instruments = {row[0]: row[1].strip().upper() for row in cursor.fetchall()}
+        cursor.execute("""
+            SELECT id_evaluacion_paciente, id_paciente, fecha_hora_evaluacion, momento_evaluacion
+            FROM dbo.evaluacion_paciente
+            WHERE fecha_hora_evaluacion < DATEADD(day, 1, CAST(? AS date))
+              AND (momento_evaluacion = 'INICIAL' OR (momento_evaluacion = 'SEGUIMIENTO' AND fecha_hora_evaluacion >= ?))
+        """, end, start)
+        evaluations = {}
+        while batch := cursor.fetchmany(8_192):
+            for evaluation_id, patient, evaluated_at, phase in batch:
+                if patient in patients:
+                    evaluations[evaluation_id] = (patient, evaluated_at, phase.strip().upper() == "INICIAL")
+
+        for instrument_id, code in instruments.items():
+            minimum, maximum = ranges[code]
+            cursor.execute("""
+                SELECT id_evaluacion_paciente, puntuacion_obtenida, id_resultado_evaluacion
+                FROM dbo.resultado_evaluacion
+                WHERE id_instrumento_evaluacion = ? AND estado_puntaje = 'VALIDO' AND puntuacion_obtenida BETWEEN ? AND ?
+            """, instrument_id, minimum, maximum)
+            while batch := cursor.fetchmany(8_192):
+                for evaluation_id, score, result_id in batch:
+                    evaluation = evaluations.get(evaluation_id)
+                    if evaluation is None:
+                        continue
+                    patient, evaluated_at, is_initial = evaluation
+                    destination = initial[code] if is_initial else followup[code]
+                    order = (evaluated_at, evaluation_id, result_id if is_initial else -result_id)
+                    previous = destination.get(patient)
+                    if previous is None or (order < previous[0] if is_initial else order > previous[0]):
+                        destination[patient] = (order, score)
+
+    return {code: summarize_scores(initial[code], followup[code]) for code in ranges}

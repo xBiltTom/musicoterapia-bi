@@ -1,14 +1,15 @@
 # Musicoterapia BI
 
-Aplicación web para explorar indicadores descriptivos de musicoterapia en pacientes con Alzheimer de un único centro. El trabajo parte de la base **transaccional** `BD_Musicoterapia_Alzheimer` en SQL Server. En esta etapa no hay ETL ni data mart.
+Aplicación web para explorar indicadores descriptivos de musicoterapia en los datos del proyecto Alzheimer. La fuente es la base **transaccional** `BD_Musicoterapia_Alzheimer` en SQL Server.
 
 ## Estado actual
 
 - **Fase 1 completada como primera versión funcional:** API FastAPI, interfaz React y consultas SQL de K1, K2 y K3 sobre tablas transaccionales.
-- **FR04 implementado:** ficha semanal por paciente para confirmar vigencia y cobertura. K4 solo se calcula cuando el registro de la semana está completo.
+- **FR01–FR03:** consulta de pacientes seudonimizados, su perfil clínico por rol y el diario de sesiones con la música que consta en la base.
+- **FR04:** consulta de las sesiones y minutos de cada paciente por semana. K4 requiere fichas semanales de vigencia y cobertura.
 - Filtros por escenario de datos y fechas. `HIBRIDO` y `SINTETICO_IA` se consultan por separado.
-- El tablero K1–K3 consulta sin modificar datos. FR04 es el único módulo actual que registra información nueva en SQL Server.
-- `database/schema.sql` es un volcado anterior y **no** representa los cambios recientes de la base. La fuente transaccional acordada es [`BD_Musicoterapia_Alzheimer.sql` en Drive](https://drive.google.com/file/d/1CWhF20zth-TU0raXBjLCyxlQHUKFx6Tt/view), copiada en [`database/BD_Musicoterapia_Alzheimer.sql`](database/BD_Musicoterapia_Alzheimer.sql). La base adjunta en SSMS tiene algunas columnas distintas de ese script; usar la migración incremental para actualizarla. No ejecutar el script completo sobre la base adjunta: contiene `DROP DATABASE`.
+- La API consulta `BD_Musicoterapia_Alzheimer` en solo lectura y valida las cuentas y permisos existentes en `usuario_sistema`.
+- La base cargada en `localhost\SQLEXPRESS` es la fuente de datos. Los scripts en `database/` quedan como referencias del diseño y para bases de prueba independientes.
 
 ## Plan de implementación por fases
 
@@ -29,13 +30,13 @@ La herramienta de la plataforma exigida por la asignatura debe confirmarse con l
 React + Vite + ECharts  →  FastAPI (/api)  →  SQL Server transaccional
 ```
 
-La interfaz usa el proxy de Vite durante el desarrollo. Al compilarla, FastAPI puede servir `frontend/dist` desde el mismo origen; así la demo puede ejecutarse en el equipo que ya tiene SQL Server. La aplicación solo escribe en `control_semanal_intervencion` al guardar FR04. La tabla se crea mediante una migración explícita.
+La interfaz usa el proxy de Vite durante el desarrollo. Al compilarla, FastAPI puede servir `frontend/dist` desde el mismo origen, de modo que el navegador pueda usar la misma cookie de sesión para la interfaz y la API.
 
 ## Iniciar en Windows
 
-Requisitos: Python 3.12, Node.js, SQL Server con `BD_Musicoterapia_Alzheimer` accesible y **ODBC Driver 18 for SQL Server**.
+Requisitos para este equipo: Python 3.12, Node.js, la instancia `localhost\SQLEXPRESS` con `BD_Musicoterapia_Alzheimer` y **ODBC Driver 17 for SQL Server**. La aplicación usa el puerto TCP local `127.0.0.1:1433` de esa instancia.
 
-Antes de usar FR04, aplicar una vez [`database/migrations/001_fr04_control_semanal.sql`](database/migrations/001_fr04_control_semanal.sql) en SSMS sobre `BD_Musicoterapia_Alzheimer`. La migración es repetible y no asigna estados históricos.
+El valor predeterminado de `APP_SOLO_LECTURA` es `true`. La conexión de escritura también comprueba el nombre de la base y rechaza `BD_Musicoterapia_Alzheimer`. Para una prueba de registro se requiere una base independiente.
 
 1. Copiar `.env.example` como `.env`. Ajustar `SERVER`, autenticación y certificado si el SQL Server usa otra configuración. La conexión predeterminada usa la cuenta de Windows que ejecuta la API.
 2. Desde la raíz del repositorio:
@@ -58,7 +59,23 @@ Antes de usar FR04, aplicar una vez [`database/migrations/001_fr04_control_seman
 
 Para probar el formato de despliegue en el mismo equipo, ejecutar `npm run build` dentro de `frontend` y reiniciar la API. FastAPI servirá la interfaz compilada en `http://localhost:8000`.
 
-La cuenta de SQL Server usada por la API necesita `SELECT` en las tablas consultadas y `INSERT`/`UPDATE` en `control_semanal_intervencion` para guardar FR04. El responsable de la ficha debe existir en `usuario_sistema` como terapeuta activo. La edición FR04 está pensada para la demo local; antes de exponerla públicamente hay que implementar autenticación y permisos por rol. No guardar credenciales en Git; `.env` está ignorado.
+## Acceso al sistema
+
+Para ingresar, usar el `username` y la contraseña de una cuenta activa de `usuario_sistema`. La aplicación valida hashes Argon2 y bcrypt.
+
+El tablero combina RP01 y RP02 y requiere ambos permisos de lectura con alcance global. FR04 es de lectura para quienes tienen acceso global a RP03. Las fichas y el diario muestran los datos permitidos por el rol de la cuenta.
+
+En modo de solo lectura, la sesión dura hasta ocho horas y se conserva en memoria de la API. El perfil y sus permisos se revalidan en SQL Server cada dos minutos cuando hay actividad. Cerrar sesión o reiniciar el proceso la invalida. Para servir la aplicación por HTTPS, definir `AUTH_COOKIE_SECURE=true`. La interfaz y la API comparten origen con el proxy de Vite o al servir la compilación desde FastAPI.
+
+La cuenta de SQL Server de la API necesita permisos de lectura. La configuración de conexión se guarda en `.env`, que está ignorado por Git.
+
+## Fichas operativas
+
+- **Pacientes (FR01).** Consulta de código, escenario y fechas del programa. El rol clínico también consulta la última visita, su diagnóstico y los medicamentos vinculados.
+- **Sesiones (FR02 y FR03).** Consulta de asistencia, experiencia, respuesta y música asociada. El cuidador consulta las sesiones de las que figura como responsable.
+- **Control semanal (FR04).** Consulta de sesiones y minutos por paciente y semana. Cuando la base carece de fichas semanales, la vista indica que K4 está pendiente de esa información.
+
+La API de estas fichas se documenta en `/docs` bajo **FR01 · Pacientes** y **FR02 y FR03 · Sesiones**.
 
 ## Indicadores implementados
 
@@ -70,26 +87,29 @@ Las consultas están en [`backend/app/queries.py`](backend/app/queries.py). El e
 | K2 · Reducción CMAI | Media de `CMAI inicial − CMAI seguimiento` por paciente con par válido; respondedor si la diferencia es ≥6. | Primera evaluación inicial anterior al fin del periodo y último seguimiento dentro del periodo. |
 | K3 · Reducción CSDD | Media de `CSDD inicial − CSDD seguimiento` por paciente con par válido. Cruce del corte: basal `>10` y seguimiento `≤10`, dividido entre pares con basal `>10`. | Misma regla de fechas que K2. |
 
-En K2 y K3 el par requiere que el seguimiento sea posterior a la evaluación inicial. Los valores faltantes o fuera de los rangos de la escala se excluyen. Si no hay denominador válido, la API devuelve `null` y la interfaz muestra `—`. Estos indicadores expresan **cambios observados**, no una atribución causal al tratamiento.
+En K2 y K3 se usan resultados marcados `VALIDO`, dentro del rango de la escala y con seguimiento posterior a la evaluación inicial. Si falta un denominador válido, la API devuelve `null` y la interfaz muestra `—`. Los indicadores describen cambios observados.
 
 ## Fuente y decisiones de datos
 
 - Informe de proyecto: `Informe_Inteligencia_de_Negocios_Alzheimer (2).docx`, secciones 4.3–4.7. El informe define siete KPI y cuatro reportes; esta fase implementa los tres primeros.
-- Todos los registros de `visita_clinica` quedaron asignados al único centro elegido anteriormente. Esa reasignación es una decisión del proyecto y debe declararse al presentar resultados históricos.
-- `paciente.estado_seguimiento` fue eliminado porque no expresaba estado semanal de intervención. `usuario_sistema.activo` tiene otra finalidad y permanece en la base.
+- `paciente.estado_seguimiento` refleja un estado general. La vigencia semanal de K4 se obtiene de FR04.
 - FR04 usa una fila por paciente, semana ISO y programa. El campo `en_intervencion` representa esa semana; `cobertura_registro` distingue `COMPLETA`, `CERO_CONFIRMADO` e `INSUFICIENTE`. No se rellenaron filas históricas automáticamente.
 - Los pacientes `HIBRIDO` y `SINTETICO_IA` tienen perfiles de resultados distintos. La interfaz impide mezclarlos en una sola tasa.
 - La carpeta `database/data/` se ignora conforme a la decisión del equipo.
 
 ## API inicial
 
-- `GET /api/salud`: verifica conexión a SQL Server.
+- `GET /api/salud`: verifica la conexión, el nombre de la base y el modo de acceso.
+- `POST /api/auth/login`: recibe `usuario` y `contrasena` como JSON y abre una sesión con cookie.
+- `GET /api/auth/sesion`: devuelve el perfil y los permisos de la sesión vigente.
+- `POST /api/auth/logout`: invalida la sesión y borra su cookie. Enviar `Content-Type: application/json`.
 - `GET /api/escenarios`: escenarios disponibles y número de pacientes.
+- `GET /api/pacientes?escenario=HIBRIDO&buscar=&pagina=1`: pacientes ordenados por código, 25 por página, con el total que coincide con el escenario y el prefijo. En solo lectura, la API pagina una copia temporal de SQL Server en memoria. Se intenta renovar después de cinco minutos cuando hay actividad y se señala cuándo se muestra la última lectura disponible.
 - `GET /api/tablero?escenario=HIBRIDO&desde=2022-01-01&hasta=2024-12-31`: K1–K3 y serie mensual de K1.
+- En solo lectura se precalcula el periodo predeterminado de cada escenario y se guardan en memoria los agregados de hasta 12 pares de escenario y periodo. Después de cinco minutos se intenta actualizar los agregados consultados. Si SQL Server agota el tiempo de espera, se muestra la última lectura disponible para ese filtro.
 - `GET /api/fr04/pacientes?escenario=HIBRIDO&semana_inicio=2024-10-28&buscar=...`: buscar pacientes candidatos a una ficha semanal.
-- `GET /api/fr04/responsables`: terapeutas activos que pueden figurar como responsables de FR04.
+- `GET /api/fr04/responsables`: devuelve el terapeuta autorizado de la sesión actual.
 - `GET /api/fr04/ficha?escenario=HIBRIDO&semana_inicio=2024-10-28&codigo_paciente=...`: vigencia, cobertura, sesiones y minutos de un paciente.
-- `PUT /api/fr04/ficha`: registrar o corregir una ficha FR04.
 - `GET /api/fr04/resumen?escenario=HIBRIDO&semana_inicio=2024-10-28`: avance semanal y K4 cuando sea calculable.
 
 La API responde con error de validación si el intervalo está invertido o el escenario no existe. Las consultas usan parámetros SQL, sin interpolar valores recibidos del navegador.
@@ -107,5 +127,4 @@ La ficha toma sesiones y minutos de `participacion_sesion` y `sesion_musical`. C
 - La compilación de React finalizó correctamente con `npm run build`.
 - La API respondió por HTTP en `/api/salud` y `/api/tablero`; la interfaz compilada respondió en `/`.
 - Para el periodo completo, `HIBRIDO` produjo K1 = 36,81 %, K2 = 1,45 y K3 = 1,51 puntos. `SINTETICO_IA` produjo K1 = 83,70 %, K2 = 13,52 y K3 = 8,97 puntos. Estos valores confirman que el filtro no mezcla escenarios.
-- La migración FR04 creó la tabla y sus claves foráneas en la base local. La búsqueda, la ficha, el resumen y los terapeutas activos respondieron por HTTP.
-- Una ficha de prueba con 3 sesiones y 68 minutos se validó mediante inserción y actualización con **rollback**; no quedó ningún registro inventado. Para la semana del 28/10/2024, K4 permanece vacío porque faltan 12 651 fichas `HIBRIDO`.
+- En la base definitiva se validan las consultas de pacientes, sesiones, tablero y control semanal con los permisos de cada rol. K4 requiere que exista el control semanal en la fuente.

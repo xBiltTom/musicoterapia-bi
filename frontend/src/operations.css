@@ -1,0 +1,66 @@
+.operation-page { display: grid; gap: 16px; }
+.mode-pill { width: fit-content; margin: 0 0 14px; }
+.dashboard-retry { align-self: flex-start; }
+.operation-heading, .operation-subheading {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+.operation-heading { align-items: flex-start; }
+.operation-heading h1 { margin: 5px 0 6px; font: 800 1.85rem/1.2 Manrope, sans-serif; color: #172b3f; }
+.operation-page :is(h2, h3) { margin: 0; color: #253f55; }
+.operation-page h2 { font: 800 1.05rem Manrope, sans-serif; }
+.operation-page h3 { font: 800 .88rem Manrope, sans-serif; }
+.operation-subheading span { color: #506a7b; font-size: .78rem; }
+.operation-columns { display: grid; grid-template-columns: minmax(190px, 285px) minmax(0, 1fr); gap: 18px; align-items: start; }
+.operation-columns > *, .operation-page fieldset { min-width: 0; }
+.operation-stack { display: grid; gap: 13px; }
+.operation-form-grid, .operation-summary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; }
+.operation-page label { min-width: 0; display: grid; gap: 6px; color: #40596b; font-size: .8rem; font-weight: 650; }
+.operation-page :is(input, select, textarea) {
+  width: 100%; min-width: 0; min-height: 40px; padding: 8px 10px;
+  border: 1px solid #c9d7dd; border-radius: 7px; background: #fff; color: #233c50; font: inherit;
+}
+.operation-page textarea { resize: vertical; }
+.operation-page :is(button, input, select, textarea):focus-visible { outline: 2px solid #158378; outline-offset: 3px; }
+.operation-primary, .operation-secondary, .operation-text { font: 700 .8rem 'DM Sans', sans-serif; border-radius: 7px; }
+.operation-primary { display: inline-block; flex-shrink: 0; padding: 10px 14px; border: 1px solid #11796e; background: #11796e; color: #fff; }
+.operation-primary:hover { background: #0d665d; }
+.operation-secondary { padding: 8px 10px; border: 1px solid #c9dbdf; background: #f5f9fa; color: #385a6b; }
+.operation-secondary:hover { background: #ebf5f4; }
+.operation-text { padding: 2px; border: 0; background: transparent; color: #116d62; text-decoration: underline; }
+.operation-page button:disabled { opacity: .6; cursor: default; }
+.operation-actions, .operation-chips { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.operation-inline { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; }
+.operation-help, .operation-error { margin: 0; font-size: .81rem; line-height: 1.5; color: #516b7d; }
+.operation-error { color: #9a3442; }
+.operation-result-list { display: grid; gap: 5px; }
+.patient-pagination { display: grid; gap: 6px; }
+.patient-results { max-height: 480px; overflow: auto; }
+.operation-result {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px; min-width: 0; text-align: left;
+  padding: 9px 8px; border: 1px solid #e1e9eb; border-radius: 7px; color: #35546a; background: #fff;
+}
+.operation-result[aria-pressed="true"] { border-color: #8ac9be; background: #eaf7f4; color: #166459; }
+.operation-result strong { min-width: 0; overflow-wrap: anywhere; font-size: .84rem; }
+.operation-result small { flex-shrink: 0; font-size: .72rem; }
+.operation-participant { margin: 0; padding: 14px; border: 1px solid #cddfe0; border-radius: 9px; }
+.operation-participant legend { color: #1d5f5b; font-weight: 750; }
+.operation-track { border: 1px solid #dce7e8; border-radius: 8px; padding: 10px; display: grid; gap: 8px; overflow-wrap: anywhere; }
+.operation-summary { margin: 0; }
+.operation-summary dt { color: #607f91; font-size: .76rem; }
+.operation-summary dd { margin: 2px 0 0; color: #24465b; font-weight: 650; font-size: .85rem; overflow-wrap: anywhere; }
+.operation-track-list { margin: 4px 0; padding-left: 18px; font-size: .81rem; }
+.operation-page > :is(.fr04-success, .error-panel) { margin: 0; }
+
+@media (max-width: 1000px) {
+  .operation-columns { grid-template-columns: 1fr; }
+  .operation-columns[data-creating="true"] > :nth-child(2) { grid-row: 1; }
+  .operation-result-list { max-height: 240px; overflow: auto; }
+}
+@media (max-width: 520px) {
+  .operation-form-grid { grid-template-columns: 1fr; }
+  .operation-heading { flex-wrap: wrap; }
+  .operation-heading h1 { font-size: 1.55rem; }
+}

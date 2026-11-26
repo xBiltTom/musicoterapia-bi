@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
+import { useSession } from './Auth'
 
 type Scenario = 'HIBRIDO' | 'SINTETICO_IA'
 type Coverage = 'COMPLETA' | 'INSUFICIENTE' | 'CERO_CONFIRMADO'
 type Summary = {
+  control_disponible: boolean
   candidatos_programa: number
   fichas_registradas: number
   fichas_pendientes: number
@@ -19,6 +21,7 @@ type Preview = {
   semana_inicio: string
   semana_fin: string
   programa: string
+  control_disponible: boolean
   registro: {
     en_intervencion: boolean
     cobertura_registro: Coverage | null
@@ -49,17 +52,17 @@ function isMonday(value: string) {
 }
 
 export default function FR04Page() {
+  const { user, request } = useSession()
+  const canEdit = user.permisos.editar_fr04 && !user.solo_lectura
   const [scenario, setScenario] = useState<Scenario>('HIBRIDO')
   const [week, setWeek] = useState('2024-10-28')
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState('')
   const [suggestions, setSuggestions] = useState<{ codigo_paciente: string }[]>([])
-  const [responsibles, setResponsibles] = useState<{ codigo_responsable: string; nombre_completo: string }[]>([])
   const [summary, setSummary] = useState<Summary | null>(null)
   const [preview, setPreview] = useState<Preview | null>(null)
   const [inIntervention, setInIntervention] = useState<boolean | null>(null)
   const [coverage, setCoverage] = useState<Coverage | ''>('')
-  const [responsible, setResponsible] = useState('')
   const [notes, setNotes] = useState('')
   const [refresh, setRefresh] = useState(0)
   const [loading, setLoading] = useState(false)
@@ -67,13 +70,6 @@ export default function FR04Page() {
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
   const validWeek = isMonday(week)
-
-  useEffect(() => {
-    fetch('/api/fr04/responsables')
-      .then(readJson<{ codigo_responsable: string; nombre_completo: string }[]>)
-      .then(setResponsibles)
-      .catch(() => setResponsibles([]))
-  }, [])
 
   useEffect(() => {
     setSelected('')
@@ -85,23 +81,23 @@ export default function FR04Page() {
     if (!validWeek) { setSuggestions([]); return }
     const controller = new AbortController()
     const params = new URLSearchParams({ escenario: scenario, semana_inicio: week, buscar: search.trim() })
-    fetch(`/api/fr04/pacientes?${params}`, { signal: controller.signal })
+    request(`/api/fr04/pacientes?${params}`, { signal: controller.signal })
       .then(readJson<{ codigo_paciente: string }[]>)
       .then(setSuggestions)
       .catch(() => { if (!controller.signal.aborted) setSuggestions([]) })
     return () => controller.abort()
-  }, [scenario, week, search, validWeek])
+  }, [scenario, week, search, validWeek, request])
 
   useEffect(() => {
     if (!validWeek) { setSummary(null); return }
     const controller = new AbortController()
     const params = new URLSearchParams({ escenario: scenario, semana_inicio: week })
-    fetch(`/api/fr04/resumen?${params}`, { signal: controller.signal })
+    request(`/api/fr04/resumen?${params}`, { signal: controller.signal })
       .then(readJson<Summary>)
       .then(setSummary)
       .catch(() => { if (!controller.signal.aborted) setSummary(null) })
     return () => controller.abort()
-  }, [scenario, week, validWeek, refresh])
+  }, [scenario, week, validWeek, refresh, request])
 
   useEffect(() => {
     if (!selected || !validWeek) { setPreview(null); return }
@@ -110,27 +106,26 @@ export default function FR04Page() {
     setError('')
     setPreview(null)
     const params = new URLSearchParams({ escenario: scenario, semana_inicio: week, codigo_paciente: selected })
-    fetch(`/api/fr04/ficha?${params}`, { signal: controller.signal })
+    request(`/api/fr04/ficha?${params}`, { signal: controller.signal })
       .then(readJson<Preview>)
       .then(data => {
         setPreview(data)
         setInIntervention(data.registro?.en_intervencion ?? null)
         setCoverage(data.registro?.cobertura_registro ?? '')
-        setResponsible(data.registro?.codigo_responsable ?? '')
         setNotes(data.registro?.observaciones ?? '')
       })
       .catch((e: Error) => { if (!controller.signal.aborted) setError(e.message) })
       .finally(() => { if (!controller.signal.aborted) setLoading(false) })
     return () => controller.abort()
-  }, [selected, scenario, week, validWeek, refresh])
+  }, [selected, scenario, week, validWeek, refresh, request])
 
   async function save() {
-    if (!preview || inIntervention === null || !responsible.trim() || (inIntervention && !coverage)) return
+    if (!canEdit || !preview || inIntervention === null || (inIntervention && !coverage)) return
     setSaving(true)
     setError('')
     setMessage('')
     try {
-      await readJson<Preview>(await fetch('/api/fr04/ficha', {
+      await readJson<Preview>(await request('/api/fr04/ficha', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -139,7 +134,6 @@ export default function FR04Page() {
           semana_inicio: week,
           en_intervencion: inIntervention,
           cobertura_registro: inIntervention ? coverage : null,
-          codigo_responsable: responsible.trim(),
           observaciones: notes.trim() || null,
         }),
       }))
@@ -156,7 +150,7 @@ export default function FR04Page() {
     <div className="fr04-page">
       <div className="eyebrow">FORMULARIO FR04 · CONTROL SEMANAL</div>
       <h1>Adherencia a la intervención</h1>
-      <p className="intro">Confirma quién estuvo en intervención y la cobertura del registro. Las sesiones y minutos se calculan desde el diario FR03.</p>
+      <p className="intro">{canEdit ? 'Confirma quién estuvo en intervención y la cobertura del registro.' : 'Consulta la vigencia y cobertura de las fichas semanales.'} Las sesiones y minutos se calculan desde el diario FR03.</p>
 
       <div className="fr04-context panel">
         <label>Escenario<select value={scenario} onChange={e => setScenario(e.target.value as Scenario)}><option value="HIBRIDO">Híbrido</option><option value="SINTETICO_IA">Sintético IA</option></select></label>
@@ -166,11 +160,13 @@ export default function FR04Page() {
 
       <div className="fr04-summary">
         <div className="fr04-stat"><small>Candidatos en el programa</small><strong>{summary ? formatter.format(summary.candidatos_programa) : '—'}</strong></div>
-        <div className="fr04-stat"><small>Fichas registradas</small><strong>{summary ? formatter.format(summary.fichas_registradas) : '—'}</strong></div>
-        <div className="fr04-stat"><small>Fichas pendientes</small><strong>{summary ? formatter.format(summary.fichas_pendientes) : '—'}</strong></div>
+        <div className="fr04-stat"><small>Fichas registradas</small><strong>{summary?.control_disponible ? formatter.format(summary.fichas_registradas) : '—'}</strong></div>
+        <div className="fr04-stat"><small>Fichas pendientes</small><strong>{summary?.control_disponible ? formatter.format(summary.fichas_pendientes) : '—'}</strong></div>
         <div className="fr04-stat highlighted"><small>K4 · adherencia semanal</small><strong>{summary?.k4_tasa_adherencia == null ? '—' : `${summary.k4_tasa_adherencia.toFixed(1)} %`}</strong></div>
       </div>
-      <p className="fr04-help">K4 se publica cuando todos los pacientes candidatos tienen ficha, ninguna cobertura es insuficiente y existe al menos un paciente en intervención. El ingreso al programa solo identifica candidatos; no confirma intervención.</p>
+      <p className="fr04-help">{summary?.estado_k4 === 'SIN_CONTROL'
+        ? 'La base contiene sesiones y participaciones. K4 requiere fichas semanales de vigencia y cobertura, que esta base todavía no contiene.'
+        : 'K4 se publica cuando todos los pacientes candidatos tienen ficha, la cobertura de los pacientes en intervención está confirmada y existe al menos un paciente en intervención.'}</p>
 
       <div className="fr04-columns">
         <section className="panel fr04-search-panel">
@@ -182,13 +178,15 @@ export default function FR04Page() {
         </section>
 
         <section className="panel fr04-form-panel">
-          <div className="eyebrow">REGISTRO FR04</div><h2>Confirmar vigencia y cobertura</h2>
-          {!preview ? <p className="fr04-placeholder">Selecciona un paciente para revisar su semana y completar la ficha.</p> : <>
-            <div className="fr04-field"><span>Vigencia en la semana</span><div className="fr04-choice"><label><input type="radio" name="vigencia" checked={inIntervention === true} onChange={() => setInIntervention(true)} /> En intervención</label><label><input type="radio" name="vigencia" checked={inIntervention === false} onChange={() => { setInIntervention(false); setCoverage('') }} /> Fuera de intervención</label></div></div>
-            {inIntervention && <label className="fr04-field">Cobertura del registro<select value={coverage} onChange={e => setCoverage(e.target.value as Coverage | '')}><option value="">Seleccionar cobertura</option><option value="COMPLETA">Completa</option><option value="CERO_CONFIRMADO">Cero sesiones confirmado</option><option value="INSUFICIENTE">Insuficiente</option></select></label>}
-            <label className="fr04-field">Terapeuta responsable<select value={responsible} onChange={e => setResponsible(e.target.value)}><option value="">Seleccionar terapeuta</option>{responsibles.map(item => <option key={item.codigo_responsable} value={item.codigo_responsable}>{item.codigo_responsable} · {item.nombre_completo}</option>)}</select></label>
-            <label className="fr04-field">Observaciones<textarea value={notes} onChange={e => setNotes(e.target.value)} maxLength={500} rows={3} placeholder="Fuente de la confirmación o incidencia de cobertura" /></label>
-            <div className="fr04-save-row"><span>Clasificación: <strong>{preview.clasificacion.replaceAll('_', ' ').toLowerCase()}</strong></span><button onClick={save} disabled={saving || inIntervention === null || !responsible.trim() || (inIntervention && !coverage)}>{saving ? 'Guardando…' : 'Guardar FR04'}</button></div>
+          <div className="eyebrow">REGISTRO FR04</div><h2>{canEdit ? 'Confirmar vigencia y cobertura' : 'Vigencia y cobertura'}</h2>
+          {!preview ? <p className="fr04-placeholder">Selecciona un paciente para revisar su ficha semanal.</p> : <>
+            <div className="fr04-field"><span>Vigencia en la semana</span><div className="fr04-choice"><label><input type="radio" name="vigencia" disabled={!canEdit} checked={inIntervention === true} onChange={() => setInIntervention(true)} /> En intervención</label><label><input type="radio" name="vigencia" disabled={!canEdit} checked={inIntervention === false} onChange={() => { setInIntervention(false); setCoverage('') }} /> Fuera de intervención</label></div></div>
+            {inIntervention && <label className="fr04-field">Cobertura del registro<select disabled={!canEdit} value={coverage} onChange={e => setCoverage(e.target.value as Coverage | '')}><option value="">Seleccionar cobertura</option><option value="COMPLETA">Completa</option><option value="CERO_CONFIRMADO">Cero sesiones confirmado</option><option value="INSUFICIENTE">Insuficiente</option></select></label>}
+            <label className="fr04-field">{canEdit ? 'La ficha se guardará a nombre de' : 'Terapeuta responsable'}
+              <input readOnly value={canEdit ? `${user.codigo_personal} · ${user.nombre_completo}` : (preview.registro?.codigo_responsable ?? '—')} />
+            </label>
+            <label className="fr04-field">Observaciones<textarea readOnly={!canEdit} value={notes} onChange={e => setNotes(e.target.value)} maxLength={500} rows={3} placeholder={canEdit ? 'Fuente de la confirmación o incidencia de cobertura' : undefined} /></label>
+            <div className="fr04-save-row"><span>Clasificación: <strong>{preview.control_disponible ? preview.clasificacion.replaceAll('_', ' ').toLowerCase() : 'sin ficha en la base'}</strong></span>{canEdit && <button onClick={save} disabled={saving || inIntervention === null || (inIntervention && !coverage)}>{saving ? 'Guardando…' : 'Guardar FR04'}</button>}</div>
           </>}
         </section>
       </div>
