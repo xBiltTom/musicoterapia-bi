@@ -1,0 +1,7 @@
+fastapi>=0.115,<1
+python-dotenv>=1,<2
+argon2-cffi>=23.1,<26
+bcrypt>=4.2,<6
+python-tds>=1.17,<2
+pyOpenSSL>=25,<27
+certifi>=2024.8.30

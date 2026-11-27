@@ -7,13 +7,12 @@ from decimal import Decimal
 from time import monotonic
 from typing import Annotated, Literal
 
-import pyodbc
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .auth import AuthenticatedUser
 from .db import (
-    READ_ONLY, TRANSIENT_SQL_STATES, DatabaseConnectionError, connection, fetch_all, fetch_one, has_table,
+    DB_ERRORS, READ_ONLY, TRANSIENT_SQL_STATES, DatabaseConnectionError, connection, fetch_all, fetch_one, has_table,
     sqlstate, table_columns, write_connection,
 )
 from .patient_directory import PATIENT_FIELDS, patient_directory
@@ -146,8 +145,7 @@ def list_patients(
         parameters += (code_prefix_pattern(prefix),)
     for attempt in range(2):
         try:
-            with connection() as conn:
-                conn.timeout = 8
+            with connection(query_timeout=8) as conn:
                 total = fetch_one(conn, f"SELECT COUNT_BIG(*) AS total FROM dbo.paciente WHERE {query_filter}", parameters)["total"]
                 rows = []
                 if offset < total:
@@ -158,8 +156,8 @@ def list_patients(
                     )
             break
         except DatabaseConnectionError as exc:
-            raise HTTPException(status_code=503, detail="SQL Server local no respondió. Inténtalo de nuevo.") from exc
-        except pyodbc.Error as exc:
+            raise HTTPException(status_code=503, detail="La base de datos no está disponible. Inténtalo de nuevo.") from exc
+        except DB_ERRORS as exc:
             state = sqlstate(exc)
             if attempt == 0 and state in TRANSIENT_SQL_STATES:
                 continue
@@ -224,7 +222,7 @@ def get_patient(patient_id: int, user: AuthenticatedUser):
                     SELECT fuente, antecedentes, preferencias, musica_a_evitar, observaciones, fecha_actualizacion_utc
                     FROM dbo.preferencia_musical_paciente WHERE id_paciente = ?
                 """, (patient_id,))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo consultar la ficha del paciente") from exc
     return {"paciente": patient, "perfil_clinico": clinical, "medicamentos": medications, "preferencias": preferences}
 
@@ -248,7 +246,7 @@ def create_patient(payload: PatientInput, user: AuthenticatedUser):
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (payload.codigo_paciente, payload.escenario, payload.sexo, payload.fecha_ingreso_programa,
                   payload.fecha_salida_programa, user.id_usuario_sistema))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo registrar el paciente") from exc
     return patient
 
@@ -281,7 +279,7 @@ def update_program(patient_id: int, payload: ProgramInput, user: AuthenticatedUs
                     INSERTED.fecha_ingreso_programa, INSERTED.fecha_salida_programa
                 WHERE id_paciente = ?
             """, (payload.sexo, start, end, patient_id))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo actualizar el registro del programa") from exc
     return updated
 
@@ -314,7 +312,7 @@ def save_clinical_profile(patient_id: int, payload: ClinicalInput, user: Authent
                             nombre_diagnostico, codigo_cie10, tiene_diagnostico_alzheimer, etapa_alzheimer)
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, patient_id, visit["id_visita_clinica"], payload.fecha_visita, *diagnostic)
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo registrar el perfil clínico") from exc
     return {"id_visita_clinica": visit["id_visita_clinica"]}
 
@@ -339,5 +337,5 @@ def save_preferences(patient_id: int, payload: PreferencesInput, user: Authentic
                         INSERT INTO dbo.preferencia_musical_paciente (fuente, antecedentes, preferencias, musica_a_evitar,
                             observaciones, id_usuario_registro, id_paciente) VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, *values)
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudieron guardar las preferencias musicales") from exc

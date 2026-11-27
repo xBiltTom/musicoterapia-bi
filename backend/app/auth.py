@@ -12,15 +12,14 @@ from time import monotonic
 from typing import Annotated
 
 import bcrypt
-import pyodbc
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, Field, SecretStr
 
 from .db import (
-    READ_ONLY, TRANSIENT_SQL_STATES, DatabaseConnectionError, connection, fetch_all, fetch_one, sqlstate,
-    write_connection,
+    DB_ERRORS, READ_ONLY, TRANSIENT_SQL_STATES, USE_AZURE, DatabaseConnectionError, connection, execute_query,
+    fetch_all, fetch_one, session_write_connection, sqlstate,
 )
 
 
@@ -28,6 +27,7 @@ router = APIRouter(prefix="/api/auth", tags=["Autenticación"])
 COOKIE_NAME = "musicoterapia_sesion"
 SESSION_SECONDS = 8 * 60 * 60
 PROFILE_CACHE_SECONDS = 120
+MEMORY_SESSIONS = READ_ONLY and not USE_AZURE
 password_hasher = PasswordHasher()
 DUMMY_HASH = password_hasher.hash(secrets.token_urlsafe(32))
 logger = logging.getLogger(__name__)
@@ -63,7 +63,11 @@ class LoginInput(BaseModel):
 
 class Permissions(BaseModel):
     ver_tablero: bool
+    ver_respuesta: bool = False
+    ver_evaluaciones: bool = False
+    ver_agitacion: bool = False
     ver_fr04: bool
+    ver_ficha_fr04: bool = False
     editar_fr04: bool
     registrar_altas: bool
     registrar_perfil_clinico: bool
@@ -120,13 +124,12 @@ def session_required() -> HTTPException:
 def load_profile(sql, lookup) -> UserProfile | None:
     for attempt in range(2):
         try:
-            with connection() as conn:
-                conn.timeout = 8
+            with connection(query_timeout=8) as conn:
                 rows = fetch_all(conn, sql, (lookup,))
             break
         except DatabaseConnectionError as exc:
-            raise HTTPException(status_code=503, detail="SQL Server local no respondió. Inténtalo de nuevo.") from exc
-        except pyodbc.Error as exc:
+            raise HTTPException(status_code=503, detail="La base de datos no está disponible. Inténtalo de nuevo.") from exc
+        except DB_ERRORS as exc:
             state = sqlstate(exc)
             if attempt == 0 and state in TRANSIENT_SQL_STATES:
                 continue
@@ -139,7 +142,10 @@ def load_profile(sql, lookup) -> UserProfile | None:
     account = rows[0]
     grants = {row["codigo_permiso"] for row in rows}
     global_access = account["alcance_datos"] == "GLOBAL"
-    can_edit = global_access and account["cargo_operativo"] == "TERAPEUTA" and "REGISTRAR_FR04" in grants
+    response = "VER_RP01" in grants
+    evaluations = global_access and "VER_RP02" in grants
+    weekly = global_access and bool({"VER_RP03", "REGISTRAR_FR04"} & grants)
+    agitation = "VER_RP04" in grants
     return UserProfile(
         id_usuario_sistema=account["id_usuario_sistema"],
         codigo_personal=account["codigo_personal"],
@@ -148,9 +154,13 @@ def load_profile(sql, lookup) -> UserProfile | None:
         alcance_datos=account["alcance_datos"],
         solo_lectura=READ_ONLY,
         permisos=Permissions(
-            ver_tablero=global_access and {"VER_RP01", "VER_RP02"} <= grants,
-            ver_fr04=global_access and ("VER_RP03" in grants or can_edit),
-            editar_fr04=can_edit,
+            ver_tablero=response or evaluations or weekly or agitation,
+            ver_respuesta=response,
+            ver_evaluaciones=evaluations,
+            ver_agitacion=agitation,
+            ver_fr04=weekly,
+            ver_ficha_fr04=weekly,
+            editar_fr04=False,
             registrar_altas=global_access and "REGISTRAR_FR01_ALTA" in grants,
             registrar_perfil_clinico=global_access and "REGISTRAR_FR01_CLIN" in grants,
             registrar_preferencias=global_access and "REGISTRAR_FR01_PREF" in grants,
@@ -198,7 +208,7 @@ def current_user(request: Request) -> UserProfile:
     if not token:
         raise session_required()
     digest = token_hash(token)
-    if READ_ONLY:
+    if MEMORY_SESSIONS:
         return current_memory_profile(digest)
     profile = load_profile(SESSION_ACCOUNT, digest)
     if profile is None:
@@ -212,17 +222,18 @@ AuthenticatedUser = Annotated[UserProfile, Depends(current_user)]
 def require_dashboard(user: Annotated[UserProfile, Depends(current_user)]):
     if not user.permisos.ver_tablero:
         raise HTTPException(status_code=403, detail="Tu rol no tiene acceso a este tablero")
+    return user
 
 
 def require_fr04(user: Annotated[UserProfile, Depends(current_user)]):
     if not user.permisos.ver_fr04:
         raise HTTPException(status_code=403, detail="Tu rol no tiene acceso al control semanal")
-
-
-def require_fr04_editor(user: Annotated[UserProfile, Depends(current_user)]) -> UserProfile:
-    if not user.permisos.editar_fr04:
-        raise HTTPException(status_code=403, detail="Tu rol no puede guardar fichas semanales")
     return user
+
+
+def require_fr04_detail(user: Annotated[UserProfile, Depends(require_fr04)]):
+    if not user.permisos.ver_ficha_fr04:
+        raise HTTPException(status_code=403, detail="Tu rol no tiene acceso a fichas individuales de FR04")
 
 
 def require_json(request: Request):
@@ -238,7 +249,7 @@ def bad_credentials() -> HTTPException:
 def register_session(account_id, password_hash, token, previous):
     digest = token_hash(token)
     previous_digest = token_hash(previous) if previous else None
-    if READ_ONLY:
+    if MEMORY_SESSIONS:
         profile = load_profile(ACTIVE_PROFILE + " AND u.id_usuario_sistema = ?", account_id)
         if profile is None:
             raise bad_credentials()
@@ -251,23 +262,27 @@ def register_session(account_id, password_hash, token, previous):
             memory_sessions[digest] = MemorySession(profile, now + SESSION_SECONDS, now + PROFILE_CACHE_SECONDS)
         return
 
-    with write_connection() as conn:
+    with session_write_connection() as conn:
         with closing(conn.cursor()) as cursor:
-            cursor.execute(
+            account_check = (
+                """SELECT id_usuario_sistema FROM dbo.usuario_sistema
+                   WHERE id_usuario_sistema = ? AND activo = 1 AND password_hash = ?"""
+                if READ_ONLY else
                 """UPDATE dbo.usuario_sistema SET ultimo_acceso = SYSUTCDATETIME()
                    OUTPUT INSERTED.id_usuario_sistema
-                   WHERE id_usuario_sistema = ? AND activo = 1 AND password_hash = ?""",
-                account_id, password_hash,
+                   WHERE id_usuario_sistema = ? AND activo = 1 AND password_hash = ?"""
             )
+            execute_query(cursor, account_check, (account_id, password_hash))
             if cursor.fetchone() is None:
                 raise bad_credentials()
-            cursor.execute("DELETE FROM dbo.sesion_autenticacion WHERE expira_utc <= SYSUTCDATETIME()")
+            execute_query(cursor, "DELETE FROM dbo.sesion_autenticacion WHERE expira_utc <= SYSUTCDATETIME()")
             if previous_digest:
-                cursor.execute("DELETE FROM dbo.sesion_autenticacion WHERE token_hash = ?", previous_digest)
-            cursor.execute(
+                execute_query(cursor, "DELETE FROM dbo.sesion_autenticacion WHERE token_hash = ?", (previous_digest,))
+            execute_query(
+                cursor,
                 """INSERT INTO dbo.sesion_autenticacion (token_hash, id_usuario_sistema, expira_utc)
                    VALUES (?, ?, DATEADD(second, ?, SYSUTCDATETIME()))""",
-                digest, account_id, SESSION_SECONDS,
+                (digest, account_id, SESSION_SECONDS),
             )
 
 
@@ -286,13 +301,13 @@ def login(payload: LoginInput, request: Request, response: Response):
         token = secrets.token_urlsafe(32)
         register_session(account["id_usuario_sistema"], password_hash, token, session_token(request))
     except DatabaseConnectionError as exc:
-        raise HTTPException(status_code=503, detail="SQL Server local no respondió. Inténtalo de nuevo.") from exc
-    except pyodbc.Error as exc:
+        raise HTTPException(status_code=503, detail="La base de datos no está disponible. Inténtalo de nuevo.") from exc
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo iniciar sesión") from exc
 
     response.set_cookie(
         key=COOKIE_NAME, value=token, max_age=SESSION_SECONDS, httponly=True, samesite="strict",
-        secure=os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true",
+        secure=USE_AZURE or os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true",
     )
 
 
@@ -304,17 +319,17 @@ def profile(user: Annotated[UserProfile, Depends(current_user)]) -> UserProfile:
 @router.post("/logout", status_code=204, dependencies=[Depends(require_json)])
 def logout(request: Request, response: Response):
     token = session_token(request)
-    if token and READ_ONLY:
+    if token and MEMORY_SESSIONS:
         with memory_lock:
             memory_sessions.pop(token_hash(token), None)
     elif token:
         try:
-            with write_connection() as conn:
+            with session_write_connection() as conn:
                 with closing(conn.cursor()) as cursor:
-                    cursor.execute("DELETE FROM dbo.sesion_autenticacion WHERE token_hash = ?", token_hash(token))
-        except pyodbc.Error as exc:
+                    execute_query(cursor, "DELETE FROM dbo.sesion_autenticacion WHERE token_hash = ?", (token_hash(token),))
+        except DB_ERRORS as exc:
             raise HTTPException(status_code=503, detail="No se pudo cerrar la sesión") from exc
     response.delete_cookie(
         COOKIE_NAME, httponly=True, samesite="strict",
-        secure=os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true",
+        secure=USE_AZURE or os.getenv("AUTH_COOKIE_SECURE", "false").lower() == "true",
     )

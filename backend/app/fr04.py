@@ -1,321 +1,106 @@
-"""Formulario FR04 y seguimiento semanal sobre la base transaccional."""
+"""Control semanal FR04 con la dosis calculada a partir de FR03."""
 
 from datetime import date, timedelta
-from typing import Annotated, Literal
 
-import pyodbc
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
 
-from .auth import UserProfile, require_fr04, require_fr04_editor
-from .db import READ_ONLY, connection, fetch_all, fetch_one, has_table, write_connection
+from .auth import require_fr04, require_fr04_detail
+from .db import DB_ERRORS, connection, datamart_connection, fetch_all, fetch_one
+from .indicadores import Population, Scenario, read_adherence
 
 
 router = APIRouter(prefix="/api/fr04", tags=["FR04 · Adherencia semanal"], dependencies=[Depends(require_fr04)])
-PROGRAM = "MUSICOTERAPIA"
 
 PATIENTS = """
-SELECT TOP (12) p.codigo_paciente
-FROM dbo.paciente AS p
-WHERE p.escenario = ?
-  AND p.fecha_ingreso_programa < DATEADD(day, 7, CAST(? AS date))
-  AND (p.fecha_salida_programa IS NULL OR p.fecha_salida_programa >= ?)
-  AND (? = N'' OR CHARINDEX(?, p.codigo_paciente) = 1)
-ORDER BY p.codigo_paciente
+SELECT TOP (12) p.CodigoPaciente AS codigo_paciente
+FROM dbo.HechoAdherencia h
+JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido') AND t.idTiempo=?
+  AND (?=N'' OR CHARINDEX(?,p.CodigoPaciente)=1)
+ORDER BY p.CodigoPaciente
 """
 
-PATIENT = """
-SELECT p.id_paciente, p.codigo_paciente, p.escenario,
-       p.fecha_ingreso_programa, p.fecha_salida_programa
-FROM dbo.paciente AS p {lock_hint}
-WHERE p.codigo_paciente = ? AND p.escenario = ?
-  AND p.fecha_ingreso_programa < DATEADD(day, 7, CAST(? AS date))
-  AND (p.fecha_salida_programa IS NULL OR p.fecha_salida_programa >= ?)
-"""
-
-RECORD = """
-SELECT en_intervencion, cobertura_registro, codigo_responsable,
-       observaciones, fecha_actualizacion_utc
-FROM dbo.control_semanal_intervencion
-WHERE id_paciente = ? AND fecha_inicio_semana = ? AND codigo_programa = ?
+PATIENT_WEEK = """
+SELECT p.idPaciente AS id_paciente,p.CodigoPaciente AS codigo_paciente,
+       h.PacientesQueCumplenDosis AS cumple,h.SesionesPorSemana AS sesiones
+FROM dbo.HechoAdherencia h
+JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido') AND t.idTiempo=? AND p.CodigoPaciente=?
 """
 
 PATIENT_SESSIONS = """
-SELECT s.codigo_sesion, s.fecha_hora_inicio_sesion,
-       ps.estado_participacion,
-       CASE WHEN ps.estado_participacion IN ('COMPLETA', 'INTERRUMPIDA')
-             AND ps.fecha_hora_ingreso_paciente IS NOT NULL
-             AND ps.fecha_hora_salida_paciente > ps.fecha_hora_ingreso_paciente
-            THEN DATEDIFF(second, ps.fecha_hora_ingreso_paciente,
-                ps.fecha_hora_salida_paciente)
-            ELSE NULL END AS segundos_realizados
-FROM dbo.participacion_sesion AS ps
-JOIN dbo.sesion_musical AS s ON s.id_sesion_musical = ps.id_sesion_musical
-WHERE ps.id_paciente = ?
-  AND s.fecha_hora_inicio_sesion >= ?
-  AND s.fecha_hora_inicio_sesion < DATEADD(day, 7, CAST(? AS date))
-ORDER BY s.fecha_hora_inicio_sesion, s.id_sesion_musical
+SELECT s.codigo_sesion, s.fecha_hora_inicio_sesion, ps.estado_participacion,
+       ps.fecha_hora_ingreso_paciente, ps.fecha_hora_salida_paciente,
+       DATEDIFF(second,ps.fecha_hora_ingreso_paciente,ps.fecha_hora_salida_paciente) AS segundos
+FROM dbo.participacion_sesion ps
+JOIN dbo.sesion_musical s ON s.id_sesion_musical=ps.id_sesion_musical
+WHERE ps.id_paciente=? AND s.fecha_hora_inicio_sesion>=? AND s.fecha_hora_inicio_sesion<?
+  AND ps.estado_participacion IN ('COMPLETA','INTERRUMPIDA')
+ORDER BY s.fecha_hora_inicio_sesion,s.id_sesion_musical
 """
-
-CANDIDATES = """
-SELECT COUNT_BIG(*) AS total FROM dbo.paciente
-WHERE escenario = ?
-  AND fecha_ingreso_programa < DATEADD(day, 7, CAST(? AS date))
-  AND (fecha_salida_programa IS NULL OR fecha_salida_programa >= ?)
-"""
-
-WEEK_RECORDS = """
-SELECT c.id_paciente, c.en_intervencion, c.cobertura_registro
-FROM dbo.control_semanal_intervencion AS c
-JOIN dbo.paciente AS p ON p.id_paciente = c.id_paciente
-WHERE c.fecha_inicio_semana = ? AND c.codigo_programa = ? AND p.escenario = ?
-  AND p.fecha_ingreso_programa < DATEADD(day, 7, CAST(? AS date))
-  AND (p.fecha_salida_programa IS NULL OR p.fecha_salida_programa >= ?)
-"""
-
-WEEK_DOSE = """
-SELECT ps.id_paciente,
-       SUM(CASE WHEN ps.estado_participacion IN ('COMPLETA', 'INTERRUMPIDA')
-                 AND ps.fecha_hora_ingreso_paciente IS NOT NULL
-                 AND ps.fecha_hora_salida_paciente > ps.fecha_hora_ingreso_paciente
-                THEN 1 ELSE 0 END) AS sesiones_realizadas,
-       SUM(CASE WHEN ps.estado_participacion IN ('COMPLETA', 'INTERRUMPIDA')
-                 AND ps.fecha_hora_ingreso_paciente IS NOT NULL
-                 AND ps.fecha_hora_salida_paciente > ps.fecha_hora_ingreso_paciente
-                THEN DATEDIFF(second, ps.fecha_hora_ingreso_paciente,
-                     ps.fecha_hora_salida_paciente) ELSE 0 END) AS segundos,
-       SUM(CASE WHEN ps.estado_participacion IN ('COMPLETA', 'INTERRUMPIDA')
-                 AND (ps.fecha_hora_ingreso_paciente IS NULL
-                   OR ps.fecha_hora_salida_paciente IS NULL
-                   OR ps.fecha_hora_salida_paciente <= ps.fecha_hora_ingreso_paciente)
-                THEN 1 ELSE 0 END) AS horas_invalidas
-FROM dbo.participacion_sesion AS ps
-JOIN dbo.sesion_musical AS s ON s.id_sesion_musical = ps.id_sesion_musical
-JOIN dbo.paciente AS p ON p.id_paciente = ps.id_paciente
-WHERE s.fecha_hora_inicio_sesion >= ?
-  AND s.fecha_hora_inicio_sesion < DATEADD(day, 7, CAST(? AS date))
-  AND p.escenario = ?
-GROUP BY ps.id_paciente
-"""
-
-
-class FR04Input(BaseModel):
-    escenario: Literal["HIBRIDO", "SINTETICO_IA"]
-    codigo_paciente: str = Field(min_length=1, max_length=60)
-    semana_inicio: date
-    en_intervencion: bool
-    cobertura_registro: Literal["COMPLETA", "INSUFICIENTE", "CERO_CONFIRMADO"] | None = None
-    codigo_responsable: str | None = Field(default=None, min_length=1, max_length=50)
-    observaciones: str | None = Field(default=None, max_length=500)
 
 
 def check_week(week: date):
     if week.weekday() != 0:
         raise HTTPException(status_code=422, detail="La semana ISO debe comenzar un lunes")
+    if week > date.max - timedelta(days=7):
+        raise HTTPException(status_code=422, detail="La semana excede el intervalo de fechas")
 
 
-def summarize_sessions(rows):
-    sessions = 0
-    seconds = 0
-    invalid = 0
-    for row in rows:
-        if row["estado_participacion"] in ("COMPLETA", "INTERRUMPIDA"):
-            duration = row["segundos_realizados"]
-            if duration is None or duration <= 0:
-                invalid += 1
-            else:
-                sessions += 1
-                seconds += int(duration)
-    return {"sesiones_realizadas": sessions, "minutos_realizados": round(seconds / 60, 2), "horas_invalidas": invalid}
-
-
-def classification(record, dose):
-    if record is None:
-        return "PENDIENTE"
-    if not record["en_intervencion"]:
-        return "FUERA"
-    if record["cobertura_registro"] not in ("COMPLETA", "CERO_CONFIRMADO") or dose["horas_invalidas"]:
-        return "INDETERMINADA"
-    if record["cobertura_registro"] == "CERO_CONFIRMADO" and dose["sesiones_realizadas"]:
-        return "INDETERMINADA"
-    if record["cobertura_registro"] == "COMPLETA" and not dose["sesiones_realizadas"]:
-        return "INDETERMINADA"
-    if dose["sesiones_realizadas"] >= 3 and dose["minutos_realizados"] >= 30:
-        return "CUMPLE"
-    return "NO_CUMPLE"
-
-
-def patient_for_week(conn, scenario, code, week, *, for_update=False):
-    query = PATIENT.format(lock_hint="WITH (UPDLOCK, HOLDLOCK)" if for_update else "")
-    patient = fetch_one(conn, query, (code, scenario, week, week))
-    if not patient:
-        raise HTTPException(status_code=404, detail="Paciente no encontrado en ese escenario y semana del programa")
-    return patient
-
-
-def preview(conn, scenario, code, week):
-    patient = patient_for_week(conn, scenario, code, week)
-    rows = fetch_all(conn, PATIENT_SESSIONS, (patient["id_paciente"], week, week))
-    dose = summarize_sessions(rows)
-    control_available = not READ_ONLY or has_table(conn, "dbo.control_semanal_intervencion")
-    record = None
-    if control_available:
-        record = fetch_one(conn, RECORD, (patient["id_paciente"], week, PROGRAM))
-    return {
-        "paciente": {"codigo_paciente": code, "escenario": scenario},
-        "semana_inicio": week,
-        "semana_fin": week + timedelta(days=6),
-        "programa": PROGRAM,
-        "registro": record,
-        "control_disponible": control_available,
-        "dosis": dose,
-        "clasificacion": classification(record, dose),
-        "sesiones": [
-            {"codigo_sesion": row["codigo_sesion"],
-             "fecha_hora_inicio_sesion": row["fecha_hora_inicio_sesion"],
-             "estado_participacion": row["estado_participacion"],
-             "minutos_realizados": round(row["segundos_realizados"] / 60, 2) if row["segundos_realizados"] is not None else None}
-            for row in rows
-        ],
-    }
-
-
-@router.get("/pacientes")
-def search_patients(
-    escenario: Literal["HIBRIDO", "SINTETICO_IA"],
-    semana_inicio: date,
-    buscar: str = Query(default="", max_length=60),
+@router.get("/pacientes", dependencies=[Depends(require_fr04_detail)])
+def patients(
+    escenario: Scenario, semana_inicio: date, poblacion: Population = "incluidos",
+    buscar: str = Query(default="", max_length=120),
 ):
     check_week(semana_inicio)
+    prefix = buscar.strip()
     try:
-        with connection() as conn:
-            return fetch_all(conn, PATIENTS, (escenario, semana_inicio, semana_inicio, buscar, buscar))
-    except pyodbc.Error as exc:
-        raise HTTPException(status_code=503, detail="No se pudo consultar FR04") from exc
-
-
-@router.get("/responsables")
-def get_responsibles(user: Annotated[UserProfile, Depends(require_fr04_editor)]):
-    return [{"codigo_responsable": user.codigo_personal, "nombre_completo": user.nombre_completo}]
-
-
-@router.get("/ficha")
-def get_form(
-    escenario: Literal["HIBRIDO", "SINTETICO_IA"],
-    codigo_paciente: str = Query(min_length=1, max_length=60),
-    semana_inicio: date = Query(),
-):
-    check_week(semana_inicio)
-    try:
-        with connection() as conn:
-            return preview(conn, escenario, codigo_paciente, semana_inicio)
-    except pyodbc.Error as exc:
-        raise HTTPException(status_code=503, detail="No se pudo consultar FR04") from exc
+        with datamart_connection() as conn:
+            return fetch_all(conn, PATIENTS, (escenario, poblacion == "incluidos", semana_inicio, prefix, prefix))
+    except DB_ERRORS as exc:
+        raise HTTPException(status_code=503, detail="No se pudo consultar el control semanal") from exc
 
 
 @router.get("/resumen")
-def get_summary(escenario: Literal["HIBRIDO", "SINTETICO_IA"], semana_inicio: date):
+def summary(escenario: Scenario, semana_inicio: date, poblacion: Population = "incluidos"):
     check_week(semana_inicio)
     try:
-        with connection() as conn:
-            candidates = int(fetch_one(conn, CANDIDATES, (escenario, semana_inicio, semana_inicio))["total"])
-            records = []
-            control_available = not READ_ONLY or has_table(conn, "dbo.control_semanal_intervencion")
-            if control_available:
-                records = fetch_all(conn, WEEK_RECORDS, (semana_inicio, PROGRAM, escenario, semana_inicio, semana_inicio))
-            dose_rows = fetch_all(conn, WEEK_DOSE, (semana_inicio, semana_inicio, escenario)) if records else []
-            doses = {
-                row["id_paciente"]: {
-                    "sesiones_realizadas": int(row["sesiones_realizadas"] or 0),
-                    "minutos_realizados": round(int(row["segundos"] or 0) / 60, 2),
-                    "horas_invalidas": int(row["horas_invalidas"] or 0),
-                }
-                for row in dose_rows
-            }
-    except pyodbc.Error as exc:
-        raise HTTPException(status_code=503, detail="No se pudo consultar FR04") from exc
-
-    counts = {"FUERA": 0, "CUMPLE": 0, "NO_CUMPLE": 0, "INDETERMINADA": 0}
-    empty_dose = {"sesiones_realizadas": 0, "minutos_realizados": 0, "horas_invalidas": 0}
-    in_intervention = 0
-    for record in records:
-        if record["en_intervencion"]:
-            in_intervention += 1
-        counts[classification(record, doses.get(record["id_paciente"], empty_dose))] += 1
-    pending = candidates - len(records)
-    complete = pending == 0 and counts["INDETERMINADA"] == 0 and in_intervention > 0
+        with datamart_connection() as conn:
+            result = read_adherence(conn, escenario, poblacion, semana_inicio, semana_inicio)
+    except DB_ERRORS as exc:
+        raise HTTPException(status_code=503, detail="No se pudo consultar la adherencia semanal") from exc
     return {
-        "escenario": escenario,
-        "semana_inicio": semana_inicio,
-        "control_disponible": control_available,
-        "candidatos_programa": candidates,
-        "fichas_registradas": len(records),
-        "fichas_pendientes": pending,
-        "en_intervencion": in_intervention,
-        "fuera_intervencion": counts["FUERA"],
-        "cumple": counts["CUMPLE"],
-        "no_cumple": counts["NO_CUMPLE"],
-        "indeterminada": counts["INDETERMINADA"],
-        "k4_tasa_adherencia": round(100 * counts["CUMPLE"] / in_intervention, 2) if complete else None,
-        "estado_k4": "CALCULABLE" if complete else "INCOMPLETO" if control_available else "SIN_CONTROL",
+        "escenario": escenario, "poblacion": poblacion, "semana_inicio": semana_inicio,
+        "en_intervencion": result["paciente_semanas"], "cumple": result["cumplen"],
+        "no_cumple": result["paciente_semanas"] - result["cumplen"],
+        "k4_tasa_adherencia": result["tasa_adherencia"], "estado_k4": result["estado"],
     }
 
 
-@router.put("/ficha")
-def save_form(payload: FR04Input, user: Annotated[UserProfile, Depends(require_fr04_editor)]):
-    check_week(payload.semana_inicio)
-    code = payload.codigo_paciente.strip()
-    responsible = user.codigo_personal
-    if payload.codigo_responsable is not None and payload.codigo_responsable.strip() != responsible:
-        raise HTTPException(status_code=403, detail="La ficha se guarda con el terapeuta de la sesión actual")
-    if not code:
-        raise HTTPException(status_code=422, detail="El código de paciente es obligatorio")
-    if payload.en_intervencion != (payload.cobertura_registro is not None):
-        raise HTTPException(status_code=422, detail="La cobertura se registra solo para pacientes en intervención")
-
+@router.get("/ficha", dependencies=[Depends(require_fr04_detail)])
+def patient_week(
+    escenario: Scenario, semana_inicio: date,
+    codigo_paciente: str = Query(min_length=1, max_length=120), poblacion: Population = "incluidos",
+):
+    check_week(semana_inicio)
     try:
-        with write_connection() as conn:
-            if not fetch_one(conn, """SELECT id_usuario_sistema AS id FROM dbo.usuario_sistema
-                                     WHERE codigo_personal = ? AND cargo_operativo = 'TERAPEUTA' AND activo = 1""", (responsible,)):
-                raise HTTPException(status_code=422, detail="El responsable debe ser un terapeuta activo registrado")
-            patient = patient_for_week(conn, payload.escenario, code, payload.semana_inicio, for_update=True)
-            rows = fetch_all(conn, PATIENT_SESSIONS, (patient["id_paciente"], payload.semana_inicio, payload.semana_inicio))
-            dose = summarize_sessions(rows)
-            if payload.en_intervencion and payload.cobertura_registro == "CERO_CONFIRMADO" and (dose["sesiones_realizadas"] or dose["horas_invalidas"]):
-                raise HTTPException(status_code=422, detail="Hay sesiones o registros sin hora válida; no puede confirmarse cero sesiones")
-            if payload.en_intervencion and payload.cobertura_registro == "COMPLETA" and (dose["horas_invalidas"] or not dose["sesiones_realizadas"]):
-                raise HTTPException(status_code=422, detail="Use cobertura insuficiente o cero sesiones confirmado")
-
-            cursor = conn.cursor()
-            try:
-                cursor.execute(
-                    """SELECT id_control_semanal FROM dbo.control_semanal_intervencion WITH (UPDLOCK, HOLDLOCK)
-                       WHERE id_paciente = ? AND fecha_inicio_semana = ? AND codigo_programa = ?""",
-                    patient["id_paciente"], payload.semana_inicio, PROGRAM,
-                )
-                existing = cursor.fetchone()
-                if existing:
-                    cursor.execute(
-                        """UPDATE dbo.control_semanal_intervencion
-                           SET en_intervencion = ?, cobertura_registro = ?, codigo_responsable = ?,
-                               observaciones = ?, fecha_actualizacion_utc = SYSUTCDATETIME()
-                           WHERE id_control_semanal = ?""",
-                        payload.en_intervencion, payload.cobertura_registro, responsible,
-                        payload.observaciones, existing[0],
-                    )
-                else:
-                    cursor.execute(
-                        """INSERT INTO dbo.control_semanal_intervencion
-                           (id_paciente, fecha_inicio_semana, codigo_programa,
-                            en_intervencion, cobertura_registro, codigo_responsable, observaciones)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        patient["id_paciente"], payload.semana_inicio, PROGRAM,
-                        payload.en_intervencion, payload.cobertura_registro, responsible,
-                        payload.observaciones,
-                    )
-            finally:
-                cursor.close()
+        with datamart_connection() as conn:
+            patient = fetch_one(conn, PATIENT_WEEK, (escenario, poblacion == "incluidos", semana_inicio, codigo_paciente))
+        if patient is None:
+            raise HTTPException(status_code=404, detail="El paciente no figura en intervención en esa semana y población")
         with connection() as conn:
-            return preview(conn, payload.escenario, code, payload.semana_inicio)
-    except pyodbc.Error as exc:
-        raise HTTPException(status_code=503, detail="No se pudo guardar FR04") from exc
+            rows = fetch_all(conn, PATIENT_SESSIONS,
+                             (patient["id_paciente"], semana_inicio, semana_inicio + timedelta(days=7)))
+    except DB_ERRORS as exc:
+        raise HTTPException(status_code=503, detail="No se pudo consultar la ficha semanal") from exc
+    seconds = sum(row["segundos"] or 0 for row in rows)
+    return {
+        "paciente": {"codigo_paciente": patient["codigo_paciente"], "escenario": escenario},
+        "semana_inicio": semana_inicio, "semana_fin": semana_inicio + timedelta(days=6),
+        "dosis": {"sesiones_realizadas": patient["sesiones"], "minutos_realizados": round(seconds / 60, 2)},
+        "clasificacion": "CUMPLE" if patient["cumple"] else "NO_CUMPLE",
+        "sesiones": [{**row, "minutos_realizados": round(row["segundos"] / 60, 2)
+                      if row["segundos"] is not None else None} for row in rows],
+    }

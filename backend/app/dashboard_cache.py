@@ -9,7 +9,7 @@ from time import monotonic
 from fastapi import HTTPException
 
 
-DashboardKey = tuple[str, date, date]
+DashboardKey = tuple[str, date, date, str, tuple[str, ...], int]
 REFRESH_SECONDS = 300
 RETRY_SECONDS = 10
 MAX_PERIODS = 12

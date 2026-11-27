@@ -30,7 +30,20 @@ class MemorySessionTests(unittest.TestCase):
                 self.assertEqual(load_profile.call_args.args[1], 42)
 
     def test_retries_a_transient_profile_error_once(self):
-        with patch.object(auth, "connection", side_effect=lambda: nullcontext(Mock())), \
+        with patch.object(auth, "connection", side_effect=lambda **_: nullcontext(Mock())), \
                 patch.object(auth, "fetch_all", side_effect=[pyodbc.Error("HYT00", "timeout"), []]) as read:
             self.assertIsNone(auth.load_profile(auth.ACTIVE_PROFILE, 42))
             self.assertEqual(read.call_count, 2)
+
+
+class WeeklyPermissionsTests(unittest.TestCase):
+    def test_summary_only_permission_does_not_grant_patient_details(self):
+        user = Mock(permisos=Mock(ver_fr04=True, ver_ficha_fr04=False))
+        self.assertIs(auth.require_fr04(user), user)
+        with self.assertRaises(HTTPException) as error:
+            auth.require_fr04_detail(user)
+        self.assertEqual(error.exception.status_code, 403)
+
+    def test_individual_detail_requires_the_explicit_permission(self):
+        user = Mock(permisos=Mock(ver_fr04=True, ver_ficha_fr04=True))
+        auth.require_fr04_detail(auth.require_fr04(user))

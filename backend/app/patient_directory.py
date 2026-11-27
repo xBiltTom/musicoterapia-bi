@@ -7,9 +7,8 @@ from datetime import datetime, timezone
 from threading import Lock
 from time import monotonic
 
-import pyodbc
 
-from .db import connection, fetch_all, sqlstate
+from .db import DB_ERRORS, connection, fetch_all, sqlstate
 
 
 PATIENT_FIELDS = "id_paciente, codigo_paciente, escenario, sexo, fecha_ingreso_programa, fecha_salida_programa"
@@ -61,10 +60,9 @@ class PatientDirectory:
 
     def _reload(self):
         try:
-            with connection() as conn:
-                conn.timeout = 20
+            with connection(query_timeout=20) as conn:
                 rows = fetch_all(conn, f"SELECT {PATIENT_FIELDS} FROM dbo.paciente")
-        except pyodbc.Error as exc:
+        except DB_ERRORS as exc:
             self.retry_at = monotonic() + RETRY_SECONDS
             logger.warning("No se pudo actualizar el directorio de pacientes (SQLSTATE %s)", sqlstate(exc))
             return

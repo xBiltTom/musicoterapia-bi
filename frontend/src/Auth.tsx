@@ -10,6 +10,7 @@ type User = {
   permisos: {
     ver_tablero: boolean
     ver_fr04: boolean
+    ver_ficha_fr04?: boolean
     editar_fr04: boolean
     registrar_altas: boolean
     registrar_perfil_clinico: boolean

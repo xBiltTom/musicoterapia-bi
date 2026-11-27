@@ -1,12 +1,10 @@
-"""API del tablero inicial sobre la base transaccional."""
+"""API de musicoterapia y su tablero dimensional."""
 
-import asyncio
-import logging
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
+from typing import Annotated, Literal
 
-import pyodbc
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -16,10 +14,13 @@ from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from . import queries
-from .auth import require_dashboard, router as auth_router
+from .auth import UserProfile, require_dashboard, router as auth_router
 from .dashboard_cache import dashboard_cache
-from .db import PROTECTED_DATABASE, READ_ONLY, ReadOnlyDatabaseError, connection, fetch_all, fetch_one, sqlstate
+from .db import (
+    DB_ERRORS, PROTECTED_DATABASES, READ_ONLY, USE_AZURE, ReadOnlyDatabaseError, connection, datamart_connection, fetch_all, fetch_one,
+)
 from .fr04 import router as fr04_router
+from .indicadores import Population, SCENARIOS, read_dashboard
 from .pacientes import router as patients_router
 from .patient_directory import patient_directory
 from .sesiones import router as sessions_router
@@ -27,37 +28,13 @@ from .sesiones import router as sessions_router
 
 DEFAULT_START = date(2022, 1, 1)
 DEFAULT_END = date(2024, 12, 31)
-logger = logging.getLogger(__name__)
-
-
-async def warm_dashboard():
-    scenarios = ("HIBRIDO", "SINTETICO_IA")
-    for attempt in range(2):
-        if attempt > 0:
-            await asyncio.sleep(30)
-        for scenario in scenarios:
-            try:
-                await run_in_threadpool(dashboard_cache.get_or_load, (scenario, DEFAULT_START, DEFAULT_END), read_dashboard)
-            except HTTPException as exc:
-                if exc.status_code == 503:
-                    break
-        else:
-            return
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    prewarm = None
-    if READ_ONLY:
+    if READ_ONLY and not USE_AZURE:
         await run_in_threadpool(patient_directory.get)
-        prewarm = asyncio.create_task(warm_dashboard())
-    try:
-        yield
-    finally:
-        if prewarm is not None:
-            prewarm.cancel()
-            with suppress(asyncio.CancelledError):
-                await prewarm
+    yield
 
 
 app = FastAPI(title="Musicoterapia BI", version="0.1.0", lifespan=lifespan)
@@ -99,39 +76,43 @@ async def read_only_error(request: Request, exc: ReadOnlyDatabaseError):
     return JSONResponse(status_code=403, content={"detail": str(exc)})
 
 
-def percentage(numerator: int, denominator: int):
-    return round(100 * numerator / denominator, 2) if denominator else None
-
-
 @app.get("/api/salud")
 def health():
+    server_info_sql = "SELECT DB_NAME() AS base, CONNECTIONPROPERTY('net_transport') AS transporte"
     try:
         with connection() as conn:
-            info = fetch_one(conn, "SELECT DB_NAME() AS base, CONNECTIONPROPERTY('net_transport') AS transporte")
-    except pyodbc.Error as exc:
+            info = fetch_one(conn, server_info_sql)
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo conectar a SQL Server") from exc
+    try:
+        with datamart_connection() as conn:
+            datamart = {"estado": "ok", **fetch_one(conn, server_info_sql)}
+    except DB_ERRORS:
+        datamart = {"estado": "no_disponible"}
     base = info["base"]
-    mode = "solo_lectura" if READ_ONLY or base.casefold() == PROTECTED_DATABASE.casefold() else "registro"
+    mode = "solo_lectura" if READ_ONLY or base.casefold() in PROTECTED_DATABASES else "registro"
     return {"estado": "ok", "fuente": "transaccional", "base": base, "modo": mode, "transporte": info["transporte"],
+            "datamart": datamart,
             "directorio_pacientes_disponible": patient_directory.snapshot is not None, "tableros_en_memoria": dashboard_cache.size()}
 
 
-@app.get("/api/escenarios", dependencies=[Depends(require_dashboard)])
-def scenarios():
-    snapshot = patient_directory.snapshot if READ_ONLY else None
-    if snapshot is not None:
-        return [{"escenario": scenario, "pacientes": len(rows)} for scenario, rows in sorted(snapshot.patients.items())]
+@app.get("/api/escenarios")
+def scenarios(user: Annotated[UserProfile, Depends(require_dashboard)]):
+    if user.alcance_datos != "GLOBAL":
+        return [{"escenario": name, "pacientes": None, "incluidos": None} for name in SCENARIOS]
     try:
-        with connection() as conn:
+        with datamart_connection() as conn:
             return fetch_all(conn, queries.SCENARIOS)
-    except pyodbc.Error as exc:
-        raise HTTPException(status_code=503, detail="No se pudo consultar SQL Server") from exc
+    except DB_ERRORS as exc:
+        raise HTTPException(status_code=503, detail="No se pudo consultar el Datamart") from exc
 
 
-@app.get("/api/tablero", dependencies=[Depends(require_dashboard)])
+@app.get("/api/tablero")
 def dashboard(
     background_tasks: BackgroundTasks,
-    escenario: str = Query(default="HIBRIDO"),
+    user: Annotated[UserProfile, Depends(require_dashboard)],
+    escenario: Literal["HIBRIDO", "SINTETICO_IA", "COMPARAR"] = Query(default="HIBRIDO"),
+    poblacion: Population = Query(default="incluidos"),
     desde: date = Query(default=DEFAULT_START),
     hasta: date = Query(default=DEFAULT_END),
 ):
@@ -142,72 +123,26 @@ def dashboard(
     if (hasta - desde).days > 3660:
         raise HTTPException(status_code=422, detail="El intervalo no puede superar diez años")
 
-    if READ_ONLY:
-        key = (escenario, desde, hasta)
-        snapshot = dashboard_cache.get_or_load(key, read_dashboard)
-        if dashboard_cache.needs_refresh(snapshot):
-            background_tasks.add_task(dashboard_cache.refresh, key, read_dashboard)
-        return snapshot.response()
-    return read_dashboard(escenario, desde, hasta)
+    permissions = user.permisos
+    reports = tuple(report for report, allowed in (
+        ("RP01", permissions.ver_respuesta), ("RP02", permissions.ver_evaluaciones),
+        ("RP03", permissions.ver_fr04), ("RP04", permissions.ver_agitacion),
+    ) if allowed)
+    owner = 0 if user.alcance_datos == "GLOBAL" else user.id_usuario_sistema
 
-
-def read_dashboard(escenario, desde, hasta):
-    try:
-        with connection() as conn:
-            patients = queries.scenario_patients(conn, escenario)
-            if not patients:
-                raise HTTPException(status_code=422, detail="Escenario desconocido")
-
-            monthly = queries.monthly_experience(conn, patients, desde, hasta)
-            paired = queries.paired_scores(conn, patients, desde, hasta)
-            k2, k3 = paired["CMAI"], paired["CSDD"]
-    except pyodbc.Error as exc:
-        state = sqlstate(exc)
-        logger.warning("No se pudieron consultar los indicadores (SQLSTATE %s)", state)
-        detail = "No se pudo consultar SQL Server"
-        if state in {"HYT00", "HYT01"}:
-            detail = "SQL Server superó el tiempo de espera al calcular los indicadores"
-        raise HTTPException(status_code=503, detail=detail) from exc
-
-    valid = sum(row["participaciones_validas"] for row in monthly)
-    positives = sum(row["positivas"] for row in monthly)
-    cmai_pairs = int(k2["pacientes_con_par"] or 0)
-    csdd_pairs = int(k3["pacientes_con_par"] or 0)
-    csdd_eligible = int(k3["basales_sobre_corte"] or 0)
-
-    return {
-        "fuente": "base transaccional",
-        "filtros": {"escenario": escenario, "desde": desde, "hasta": hasta},
-        "k1": {
-            "tasa_positiva": percentage(positives, valid),
-            "positivas": positives,
-            "neutras": sum(row["neutras"] for row in monthly),
-            "negativas": sum(row["negativas"] for row in monthly),
-            "participaciones_validas": valid,
-        },
-        "k2": {
-            "reduccion_promedio": round(k2["reduccion_promedio"], 2) if k2["reduccion_promedio"] is not None else None,
-            "pacientes_con_par": cmai_pairs,
-            "respondedores": int(k2["respondedores"] or 0),
-            "tasa_respondedores": percentage(int(k2["respondedores"] or 0), cmai_pairs),
-        },
-        "k3": {
-            "reduccion_promedio": round(k3["reduccion_promedio"], 2) if k3["reduccion_promedio"] is not None else None,
-            "pacientes_con_par": csdd_pairs,
-            "basales_sobre_corte": csdd_eligible,
-            "cruces_corte": int(k3["cruces_corte"] or 0),
-            "tasa_cruce_corte": percentage(int(k3["cruces_corte"] or 0), csdd_eligible),
-        },
-        "respuesta_mensual": [
-            {
-                "mes": row["mes"],
-                "positivas": int(row["positivas"]),
-                "participaciones_validas": int(row["participaciones_validas"]),
-                "tasa_positiva": percentage(int(row["positivas"]), int(row["participaciones_validas"])),
-            }
-            for row in monthly
-        ],
-    }
+    results = {}
+    for scenario in SCENARIOS if escenario == "COMPARAR" else (escenario,):
+        key = (scenario, desde, hasta, poblacion, reports, owner)
+        if READ_ONLY:
+            snapshot = dashboard_cache.get_or_load(key, read_dashboard)
+            if dashboard_cache.needs_refresh(snapshot):
+                background_tasks.add_task(dashboard_cache.refresh, key, read_dashboard)
+            results[scenario] = snapshot.response()
+        else:
+            results[scenario] = read_dashboard(*key)
+    if escenario == "COMPARAR":
+        return {"fuente": "Datamart", "escenarios": results}
+    return results[escenario]
 
 
 FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"

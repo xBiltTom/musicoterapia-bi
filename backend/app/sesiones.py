@@ -5,12 +5,11 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
 
-import pyodbc
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import AfterValidator, Field, NaiveDatetime, field_validator, model_validator
 
 from .auth import AuthenticatedUser
-from .db import READ_ONLY, connection, fetch_all, fetch_one, has_column, write_connection
+from .db import DB_ERRORS, READ_ONLY, connection, fetch_all, fetch_one, has_column, write_connection
 from .pacientes import FormInput, Scenario, Text, lock_patient
 
 
@@ -177,7 +176,7 @@ def patient_options(
                   AND ((? = 1 AND (? = N'' OR CHARINDEX(?, codigo_paciente) = 1)) OR codigo_paciente = ?)
                 ORDER BY codigo_paciente
             """, (escenario, fecha, fecha, global_access, search, search, search))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo buscar participantes") from exc
 
 
@@ -200,7 +199,7 @@ def music_options(user: AuthenticatedUser, escenario: Scenario, buscar: str = Qu
                     AND (? = N'' OR CHARINDEX(?, l.nombre_lista_reproduccion) > 0)
                 ORDER BY l.nombre_lista_reproduccion, l.id_lista_reproduccion
             """, (escenario, search, search))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo consultar el catálogo musical") from exc
     return {"pistas": tracks, "listas": playlists}
 
@@ -219,7 +218,7 @@ def list_sessions(
                 ORDER BY s.fecha_hora_inicio_sesion DESC, s.id_sesion_musical DESC
                 OFFSET ? ROWS FETCH NEXT 26 ROWS ONLY
             """, (user.alcance_datos == "GLOBAL", user.id_usuario_sistema, escenario, search, search, (pagina - 1) * 25))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo consultar el diario de sesiones") from exc
     return {"sesiones": rows[:25], "hay_mas": len(rows) > 25}
 
@@ -255,7 +254,7 @@ def get_session(session_id: PositiveId, escenario: Scenario, user: Authenticated
                 JOIN dbo.paciente AS p ON p.id_paciente = ps.id_paciente
                 WHERE ps.id_sesion_musical = ? AND p.escenario = ? ORDER BY x.orden_reproduccion
             """, (session_id, escenario))
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo consultar la sesión") from exc
     for participant in participants:
         participant_id = participant["id_participacion_sesion"]
@@ -327,6 +326,6 @@ def create_session(payload: SessionInput, user: AuthenticatedUser):
                   payload.inicio_musica, payload.uso_musica, payload.id_lista_reproduccion, user.id_usuario_sistema))
             for participant in payload.participantes:
                 insert_participation(conn, session["id_sesion_musical"], payload, participant)
-    except pyodbc.Error as exc:
+    except DB_ERRORS as exc:
         raise HTTPException(status_code=503, detail="No se pudo registrar la sesión") from exc
     return session

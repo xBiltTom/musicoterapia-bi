@@ -2,8 +2,10 @@ import { useEffect, useState } from 'react'
 import { useSession } from './Auth'
 
 export type Scenario = 'HIBRIDO' | 'SINTETICO_IA'
+export type Population = 'incluidos' | 'todos'
 
 export const scenarioLabels: Record<Scenario, string> = { HIBRIDO: 'Híbrido', SINTETICO_IA: 'Sintético IA' }
+export const populationLabels: Record<Population, string> = { incluidos: 'Pacientes elegibles', todos: 'Todos los pacientes' }
 
 export async function readOperation<T>(response: Response): Promise<T> {
   const body = response.status === 204 ? null : await response.json().catch(() => null)

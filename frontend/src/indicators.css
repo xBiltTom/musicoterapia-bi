@@ -1,0 +1,45 @@
+.indicators .indicator-filters {
+  grid-template-columns: 1.15fr 1.15fr 1fr 1fr auto;
+  margin-top: 0;
+}
+
+.indicator-loading { margin-top: 1.5rem; }
+.indicator-populations { display: flex; flex-wrap: wrap; gap: .5rem 1.5rem; margin-bottom: 1rem; font-size: .8rem; color: #526779; }
+.indicator-cards .kpi-card { min-height: 0; }
+.indicator-cards h3 { margin: .4rem 0 .75rem; }
+.indicator-reading > div { display: flex; align-items: baseline; flex-wrap: wrap; gap: .2rem .4rem; }
+.indicator-reading strong { font: 800 1.7rem Manrope, sans-serif; color: #183549; font-variant-numeric: tabular-nums; }
+.indicator-reading small { color: #516779; }
+.indicator-reading p { min-height: 0; margin: .3rem 0 0; color: #516779; font-size: .75rem; }
+.indicator-status { border-radius: 5px; font-size: .67rem; font-weight: 800; padding: .2rem .35rem; white-space: nowrap; }
+.status-verde { color: #106148; background: #e4f6ed; }
+.status-ambar { color: #7e4b00; background: #fff2ce; }
+.status-rojo { color: #963b37; background: #fceae8; }
+.status-sin_datos { color: #536573; background: #edf1f4; }
+.indicator-table-wrap { overflow-x: auto; padding: 0; }
+.indicator-table { width: 100%; min-width: 660px; border-collapse: collapse; }
+.indicator-table th, .indicator-table td { text-align: left; vertical-align: top; padding: .85rem 1rem; border-bottom: 1px solid #e8edf0; }
+.indicator-table thead th { background: #f4f8fa; color: #435b6e; font-size: .78rem; }
+.indicator-table tbody th { width: 27%; font: 800 .85rem / 1.4 Manrope, sans-serif; }
+.indicator-table tbody th span { display: block; }
+.indicator-table tbody tr:last-child > * { border-bottom: 0; }
+.indicator-delta { white-space: nowrap; color: #435b6e; font-weight: 700; font-size: .9rem; font-variant-numeric: tabular-nums; }
+.indicator-legend { display: flex; flex-wrap: wrap; gap: 1rem; color: #536779; font-size: .75rem; margin-top: .75rem; }
+.indicator-legend i { display: inline-block; width: .65rem; height: .65rem; border-radius: 50%; margin-right: .35rem; }
+.indicator-composition h3 { margin: .9rem 0 0; font-size: .83rem; }
+.indicator-composition .stacked-bar { margin: .55rem 0 .75rem; }
+.indicator-composition .composition-list { margin-bottom: .75rem; gap: .35rem; }
+.indicator-composition .composition-list > div { grid-template-columns: 9px 1fr auto; }
+.module-navigation { display: grid; gap: .35rem; margin-top: 2.5rem; }
+
+@media (max-width: 760px) {
+  .module-navigation { display: flex; flex-wrap: wrap; margin-top: .75rem; }
+}
+
+@media (max-width: 1100px) {
+  .indicators .indicator-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 520px) {
+  .indicators .indicator-filters { grid-template-columns: minmax(0, 1fr); }
+}

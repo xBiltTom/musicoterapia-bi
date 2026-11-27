@@ -1,111 +1,115 @@
-"""Consultas directas a las tablas transaccionales.
-
-Todas reciben parametros posicionales. No se crean vistas, tablas ni data marts.
-"""
-
-from collections import Counter, defaultdict
-from contextlib import closing
+"""Consultas parametrizadas de los indicadores dimensionales."""
 
 SCENARIOS = """
-SELECT escenario, COUNT_BIG(*) AS pacientes
-FROM dbo.paciente
-GROUP BY escenario
-ORDER BY escenario
+SELECT Escenario AS escenario, COUNT_BIG(*) AS pacientes,
+       SUM(CASE WHEN Inclusion=N'Incluido' THEN 1 ELSE 0 END) AS incluidos
+FROM dbo.DimPaciente
+GROUP BY Escenario
+ORDER BY Escenario
 """
 
-def scenario_patients(conn, scenario):
-    with closing(conn.cursor()) as cursor:
-        cursor.execute("SELECT id_paciente FROM dbo.paciente WHERE escenario = ?", scenario)
-        return {row[0] for row in cursor.fetchall()}
+MONTHLY_RESPONSE = """
+SELECT t.Mes AS mes, SUM(h.Positivas) AS positivas, SUM(h.Neutras) AS neutras,
+       SUM(h.Negativas) AS negativas, SUM(h.MinutosRespuesta) AS minutos_respuesta,
+       SUM(h.ConRespuesta) AS con_respuesta, SUM(h.RespuestasObservadas) AS respuestas_observadas,
+       SUM(h.SinRespuesta) AS sin_respuesta
+FROM dbo.HechoRespuestaDiaria h
+JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+JOIN dbo.DimCuidador c ON c.KeyCuidador=h.KeyCuidador
+WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido')
+  AND t.idTiempo BETWEEN ? AND ? AND (?=0 OR c.idUsuarioSistema=?)
+GROUP BY t.Mes
+ORDER BY t.Mes
+OPTION (MAXDOP 1, MAX_GRANT_PERCENT=1)
+"""
 
+PAIRED_SCORES = """
+WITH seguimientos AS (
+    SELECT h.KeyPaciente,h.Instrumento,h.FechaHora,h.Puntaje,
+           ROW_NUMBER() OVER (PARTITION BY h.KeyPaciente,h.Instrumento
+                              ORDER BY h.FechaHora DESC,h.IdEvaluacion DESC) orden
+    FROM dbo.HechoPuntajeValido h
+    JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+    JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+    WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido')
+      AND t.idTiempo BETWEEN ? AND ? AND h.Instrumento IN('CMAI','CSDD') AND h.Momento='SEGUIMIENTO'
+)
+SELECT s.Instrumento AS instrumento, COUNT_BIG(*) AS pares, AVG(b.Puntaje-s.Puntaje) AS reduccion,
+       SUM(CASE WHEN b.Puntaje-s.Puntaje>=6 THEN 1 ELSE 0 END) AS respondedores,
+       SUM(CASE WHEN b.Puntaje>10 THEN 1 ELSE 0 END) AS basales_sobre_corte,
+       SUM(CASE WHEN b.Puntaje>10 AND s.Puntaje<=10 THEN 1 ELSE 0 END) AS cruces_corte
+FROM seguimientos s
+CROSS APPLY (
+    SELECT TOP (1) h.Puntaje
+    FROM dbo.HechoPuntajeValido h
+    WHERE h.KeyPaciente=s.KeyPaciente AND h.Instrumento=s.Instrumento
+      AND h.Momento='INICIAL' AND h.FechaHora<s.FechaHora
+    ORDER BY h.FechaHora,h.IdEvaluacion
+) b
+WHERE s.orden=1
+GROUP BY s.Instrumento
+OPTION (MAXDOP 1, MAX_GRANT_PERCENT=1)
+"""
 
-def monthly_experience(conn, patients, start, end):
-    """Agrupa K1 sin ejecutar la unión masiva de tres tablas en SQL Server Express."""
-    counts = defaultdict(Counter)
-    with closing(conn.cursor()) as cursor:
-        cursor.execute("""
-            SELECT id_sesion_musical, CONVERT(char(7), fecha_hora_inicio_sesion, 120)
-            FROM dbo.sesion_musical
-            WHERE fecha_hora_inicio_sesion >= ? AND fecha_hora_inicio_sesion < DATEADD(day, 1, CAST(? AS date))
-        """, start, end)
-        months = {row[0]: row[1] for row in cursor.fetchall()}
-        if not months:
-            return []
-        cursor.execute("""
-            SELECT id_sesion_musical, id_paciente, experiencia_sesion
-            FROM dbo.participacion_sesion
-            WHERE experiencia_sesion IN ('POSITIVA', 'NEUTRA', 'NEGATIVA')
-        """)
-        while batch := cursor.fetchmany(8_192):
-            for session_id, patient_id, experience in batch:
-                month = months.get(session_id)
-                if month and patient_id in patients:
-                    counts[month][experience.strip().upper()] += 1
+ADHERENCE = """
+SELECT COALESCE(SUM(h.PacientesEnIntervencion),0) AS paciente_semanas,
+       COALESCE(SUM(h.PacientesQueCumplenDosis),0) AS cumplen
+FROM dbo.HechoAdherencia h
+JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido') AND t.idTiempo BETWEEN ? AND ?
+OPTION (MAXDOP 1, MAX_GRANT_PERCENT=1)
+"""
 
-    return [{"mes": month, "positivas": values["POSITIVA"], "neutras": values["NEUTRA"],
-             "negativas": values["NEGATIVA"], "participaciones_validas": sum(values.values())}
-            for month, values in sorted(counts.items())]
+MMSE = """
+WITH puntajes AS (
+    SELECT h.Puntaje,t.idTiempo,
+           FIRST_VALUE(h.Puntaje) OVER (PARTITION BY h.KeyPaciente ORDER BY h.FechaHora,h.IdEvaluacion) primero,
+           MIN(t.idTiempo) OVER (PARTITION BY h.KeyPaciente) fecha_primera,
+           ROW_NUMBER() OVER (PARTITION BY h.KeyPaciente ORDER BY h.FechaHora DESC,h.IdEvaluacion DESC) orden
+    FROM dbo.HechoPuntajeValido h
+    JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+    JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+    WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido')
+      AND t.idTiempo BETWEEN ? AND ? AND h.Instrumento='MMSE'
+)
+SELECT COUNT_BIG(*) AS pacientes, AVG(Puntaje) AS promedio,
+       AVG(CASE WHEN idTiempo>fecha_primera THEN Puntaje-primero END) AS variacion,
+       COUNT_BIG(CASE WHEN idTiempo>fecha_primera THEN 1 END) AS pacientes_con_variacion
+FROM puntajes
+WHERE orden=1
+OPTION (MAXDOP 1, MAX_GRANT_PERCENT=1)
+"""
 
-
-def summarize_scores(initial, followup):
-    count = 0
-    total = 0
-    responders = 0
-    above_cut = 0
-    crossings = 0
-    for patient, (baseline_order, baseline_score) in initial.items():
-        latest = followup.get(patient)
-        if latest is None or baseline_order[0] >= latest[0][0]:
-            continue
-        score = latest[1]
-        change = baseline_score - score
-        count += 1
-        total += change
-        responders += change >= 6
-        above_cut += baseline_score > 10
-        crossings += baseline_score > 10 and score <= 10
-    return {"pacientes_con_par": count, "reduccion_promedio": float(total / count) if count else None,
-            "respondedores": responders, "basales_sobre_corte": above_cut, "cruces_corte": crossings}
-
-
-def paired_scores(conn, patients, start, end):
-    """Compara el primer basal válido con el último seguimiento del periodo."""
-    ranges = {"CMAI": (29, 203), "CSDD": (0, 38)}
-    initial = {code: {} for code in ranges}
-    followup = {code: {} for code in ranges}
-    with closing(conn.cursor()) as cursor:
-        cursor.execute("""SELECT id_instrumento_evaluacion, codigo_instrumento
-                          FROM dbo.instrumento_evaluacion WHERE codigo_instrumento IN ('CMAI', 'CSDD')""")
-        instruments = {row[0]: row[1].strip().upper() for row in cursor.fetchall()}
-        cursor.execute("""
-            SELECT id_evaluacion_paciente, id_paciente, fecha_hora_evaluacion, momento_evaluacion
-            FROM dbo.evaluacion_paciente
-            WHERE fecha_hora_evaluacion < DATEADD(day, 1, CAST(? AS date))
-              AND (momento_evaluacion = 'INICIAL' OR (momento_evaluacion = 'SEGUIMIENTO' AND fecha_hora_evaluacion >= ?))
-        """, end, start)
-        evaluations = {}
-        while batch := cursor.fetchmany(8_192):
-            for evaluation_id, patient, evaluated_at, phase in batch:
-                if patient in patients:
-                    evaluations[evaluation_id] = (patient, evaluated_at, phase.strip().upper() == "INICIAL")
-
-        for instrument_id, code in instruments.items():
-            minimum, maximum = ranges[code]
-            cursor.execute("""
-                SELECT id_evaluacion_paciente, puntuacion_obtenida, id_resultado_evaluacion
-                FROM dbo.resultado_evaluacion
-                WHERE id_instrumento_evaluacion = ? AND estado_puntaje = 'VALIDO' AND puntuacion_obtenida BETWEEN ? AND ?
-            """, instrument_id, minimum, maximum)
-            while batch := cursor.fetchmany(8_192):
-                for evaluation_id, score, result_id in batch:
-                    evaluation = evaluations.get(evaluation_id)
-                    if evaluation is None:
-                        continue
-                    patient, evaluated_at, is_initial = evaluation
-                    destination = initial[code] if is_initial else followup[code]
-                    order = (evaluated_at, evaluation_id, result_id if is_initial else -result_id)
-                    previous = destination.get(patient)
-                    if previous is None or (order < previous[0] if is_initial else order > previous[0]):
-                        destination[patient] = (order, score)
-
-    return {code: summarize_scores(initial[code], followup[code]) for code in ranges}
+AGITATION = """
+WITH trimestres AS (
+    SELECT h.KeyPaciente,DATETRUNC(quarter,t.idTiempo) trimestre,
+           CAST(SUM(h.Episodios) AS decimal(19,9))/SUM(h.TurnosValidos) tasa,
+           SUM(h.TurnosValidos) turnos
+    FROM dbo.HechoTurnoDiario h
+    JOIN dbo.DimPaciente p ON p.KeyPaciente=h.KeyPaciente
+    JOIN dbo.DimTiempo t ON t.KeyTiempo=h.KeyTiempo
+    JOIN dbo.DimCuidador c ON c.KeyCuidador=h.KeyCuidador
+    WHERE p.Escenario=? AND (?=0 OR p.Inclusion=N'Incluido')
+      AND t.idTiempo BETWEEN ? AND ? AND (?=0 OR c.idUsuarioSistema=?)
+    GROUP BY h.KeyPaciente,DATETRUNC(quarter,t.idTiempo)
+), extremos AS (
+    SELECT *, MIN(trimestre) OVER (PARTITION BY KeyPaciente) primero,
+              MAX(trimestre) OVER (PARTITION BY KeyPaciente) ultimo
+    FROM trimestres
+), tasas AS (
+    SELECT KeyPaciente,
+           MAX(CASE WHEN trimestre=primero THEN tasa END) inicial,
+           MAX(CASE WHEN trimestre=ultimo THEN tasa END) reciente,
+           SUM(turnos) turnos
+    FROM extremos
+    WHERE primero<>ultimo AND trimestre IN (primero,ultimo)
+    GROUP BY KeyPaciente
+)
+SELECT COUNT_BIG(*) AS pacientes_comparables, AVG(inicial) AS tasa_inicial,
+       AVG(reciente) AS tasa_reciente, AVG(inicial-reciente) AS reduccion,
+       COALESCE(SUM(turnos),0) AS turnos_comparados
+FROM tasas
+OPTION (MAXDOP 1, MAX_GRANT_PERCENT=1)
+"""

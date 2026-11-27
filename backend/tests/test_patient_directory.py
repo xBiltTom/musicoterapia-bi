@@ -15,7 +15,7 @@ class PatientDirectoryTests(unittest.TestCase):
             {"escenario": "HIBRIDO", "codigo_paciente": "h-001", "id_paciente": 1},
             {"escenario": "SINTETICO_IA", "codigo_paciente": "H-003", "id_paciente": 3},
         ]
-        with patch.object(directory, "connection", side_effect=lambda: nullcontext(Mock())), \
+        with patch.object(directory, "connection", side_effect=lambda **_: nullcontext(Mock())), \
                 patch.object(directory, "fetch_all", return_value=rows) as read:
             result = store.get()
             self.assertEqual([row["id_paciente"] for row in result.matching("HIBRIDO", "h-")], [1, 2])

@@ -1,201 +1,112 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useSession } from './Auth'
+import { displayDateTime, populationLabels, scenarioLabels, useOperationQuery } from './operations'
+import type { Population, Scenario } from './operations'
 
-type Scenario = 'HIBRIDO' | 'SINTETICO_IA'
-type Coverage = 'COMPLETA' | 'INSUFICIENTE' | 'CERO_CONFIRMADO'
 type Summary = {
-  control_disponible: boolean
-  candidatos_programa: number
-  fichas_registradas: number
-  fichas_pendientes: number
   en_intervencion: number
-  fuera_intervencion: number
   cumple: number
   no_cumple: number
-  indeterminada: number
   k4_tasa_adherencia: number | null
-  estado_k4: string
 }
 type Preview = {
-  paciente: { codigo_paciente: string; escenario: Scenario }
+  paciente: { codigo_paciente: string }
   semana_inicio: string
   semana_fin: string
-  programa: string
-  control_disponible: boolean
-  registro: {
-    en_intervencion: boolean
-    cobertura_registro: Coverage | null
-    codigo_responsable: string
-    observaciones: string | null
-    fecha_actualizacion_utc: string
-  } | null
-  dosis: { sesiones_realizadas: number; minutos_realizados: number; horas_invalidas: number }
-  clasificacion: string
+  dosis: { sesiones_realizadas: number; minutos_realizados: number }
+  clasificacion: 'CUMPLE' | 'NO_CUMPLE'
   sesiones: {
     codigo_sesion: string
     fecha_hora_inicio_sesion: string
-    estado_participacion: string
+    fecha_hora_ingreso_paciente: string | null
+    fecha_hora_salida_paciente: string | null
     minutos_realizados: number | null
   }[]
 }
 
-const formatter = new Intl.NumberFormat('es-PE')
-
-async function readJson<T>(response: Response): Promise<T> {
-  const body = await response.json()
-  if (!response.ok) throw new Error(body.detail || 'No se pudo completar la consulta')
-  return body as T
-}
-
-function isMonday(value: string) {
-  return Boolean(value) && new Date(`${value}T12:00:00`).getDay() === 1
-}
+const integer = new Intl.NumberFormat('es-PE')
+const decimal = new Intl.NumberFormat('es-PE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 
 export default function FR04Page() {
-  const { user, request } = useSession()
-  const canEdit = user.permisos.editar_fr04 && !user.solo_lectura
-  const [scenario, setScenario] = useState<Scenario>('HIBRIDO')
-  const [week, setWeek] = useState('2024-10-28')
+  const { user } = useSession()
+  const [filters, setFilters] = useState<{ escenario: Scenario; poblacion: Population; semana_inicio: string }>({
+    escenario: 'HIBRIDO', poblacion: 'incluidos', semana_inicio: '2023-07-24',
+  })
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState('')
-  const [suggestions, setSuggestions] = useState<{ codigo_paciente: string }[]>([])
-  const [summary, setSummary] = useState<Summary | null>(null)
-  const [preview, setPreview] = useState<Preview | null>(null)
-  const [inIntervention, setInIntervention] = useState<boolean | null>(null)
-  const [coverage, setCoverage] = useState<Coverage | ''>('')
-  const [notes, setNotes] = useState('')
-  const [refresh, setRefresh] = useState(0)
-  const [loading, setLoading] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
-  const validWeek = isMonday(week)
+  const validWeek = Boolean(filters.semana_inicio) && new Date(filters.semana_inicio + 'T12:00:00').getDay() === 1
+  const showPatientDetails = validWeek && user.permisos.ver_ficha_fr04 === true
+  const summary = useOperationQuery<Summary>(validWeek ? '/api/fr04/resumen?' + new URLSearchParams(filters) : null)
+  const patients = useOperationQuery<{ codigo_paciente: string }[]>(showPatientDetails
+    ? '/api/fr04/pacientes?' + new URLSearchParams({ ...filters, buscar: search.trim() }) : null)
+  const patient = useOperationQuery<Preview>(showPatientDetails && selected
+    ? '/api/fr04/ficha?' + new URLSearchParams({ ...filters, codigo_paciente: selected }) : null)
+  const stats = summary.data
+  const ficha = patient.data
 
-  useEffect(() => {
+  function changeFilters(next: typeof filters) {
+    setFilters(next)
     setSelected('')
-    setPreview(null)
-    setMessage('')
-  }, [scenario, week])
-
-  useEffect(() => {
-    if (!validWeek) { setSuggestions([]); return }
-    const controller = new AbortController()
-    const params = new URLSearchParams({ escenario: scenario, semana_inicio: week, buscar: search.trim() })
-    request(`/api/fr04/pacientes?${params}`, { signal: controller.signal })
-      .then(readJson<{ codigo_paciente: string }[]>)
-      .then(setSuggestions)
-      .catch(() => { if (!controller.signal.aborted) setSuggestions([]) })
-    return () => controller.abort()
-  }, [scenario, week, search, validWeek, request])
-
-  useEffect(() => {
-    if (!validWeek) { setSummary(null); return }
-    const controller = new AbortController()
-    const params = new URLSearchParams({ escenario: scenario, semana_inicio: week })
-    request(`/api/fr04/resumen?${params}`, { signal: controller.signal })
-      .then(readJson<Summary>)
-      .then(setSummary)
-      .catch(() => { if (!controller.signal.aborted) setSummary(null) })
-    return () => controller.abort()
-  }, [scenario, week, validWeek, refresh, request])
-
-  useEffect(() => {
-    if (!selected || !validWeek) { setPreview(null); return }
-    const controller = new AbortController()
-    setLoading(true)
-    setError('')
-    setPreview(null)
-    const params = new URLSearchParams({ escenario: scenario, semana_inicio: week, codigo_paciente: selected })
-    request(`/api/fr04/ficha?${params}`, { signal: controller.signal })
-      .then(readJson<Preview>)
-      .then(data => {
-        setPreview(data)
-        setInIntervention(data.registro?.en_intervencion ?? null)
-        setCoverage(data.registro?.cobertura_registro ?? '')
-        setNotes(data.registro?.observaciones ?? '')
-      })
-      .catch((e: Error) => { if (!controller.signal.aborted) setError(e.message) })
-      .finally(() => { if (!controller.signal.aborted) setLoading(false) })
-    return () => controller.abort()
-  }, [selected, scenario, week, validWeek, refresh, request])
-
-  async function save() {
-    if (!canEdit || !preview || inIntervention === null || (inIntervention && !coverage)) return
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      await readJson<Preview>(await request('/api/fr04/ficha', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          escenario: scenario,
-          codigo_paciente: selected,
-          semana_inicio: week,
-          en_intervencion: inIntervention,
-          cobertura_registro: inIntervention ? coverage : null,
-          observaciones: notes.trim() || null,
-        }),
-      }))
-      setMessage('Ficha semanal guardada. La clasificación y el resumen se actualizaron.')
-      setRefresh(value => value + 1)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'No se pudo guardar FR04')
-    } finally {
-      setSaving(false)
-    }
+    setSearch('')
   }
 
-  return (
-    <div className="fr04-page">
-      <div className="eyebrow">FORMULARIO FR04 · CONTROL SEMANAL</div>
-      <h1>Adherencia a la intervención</h1>
-      <p className="intro">{canEdit ? 'Confirma quién estuvo en intervención y la cobertura del registro.' : 'Consulta la vigencia y cobertura de las fichas semanales.'} Las sesiones y minutos se calculan desde el diario FR03.</p>
-
-      <div className="fr04-context panel">
-        <label>Escenario<select value={scenario} onChange={e => setScenario(e.target.value as Scenario)}><option value="HIBRIDO">Híbrido</option><option value="SINTETICO_IA">Sintético IA</option></select></label>
-        <label>Inicio de semana ISO<input type="date" value={week} onChange={e => setWeek(e.target.value)} /></label>
-        <span className={validWeek ? 'week-valid' : 'week-invalid'}>{validWeek ? 'Semana válida · lunes a domingo' : 'Selecciona un lunes'}</span>
+  return <div className="operation-page">
+    <div className="title-row"><div><h1>Control semanal de adherencia</h1>
+      <p className="intro">FR04 se calcula a partir de las sesiones registradas en FR03.</p>
+    </div></div>
+    <section className="panel operation-stack">
+      <div className="operation-form-grid fr04-filters">
+        <label>Escenario<select value={filters.escenario}
+          onChange={event => changeFilters({ ...filters, escenario: event.target.value as Scenario })}>
+          <option value="HIBRIDO">{scenarioLabels.HIBRIDO}</option><option value="SINTETICO_IA">{scenarioLabels.SINTETICO_IA}</option>
+        </select></label>
+        <label>Población<select value={filters.poblacion}
+          onChange={event => changeFilters({ ...filters, poblacion: event.target.value as Population })}>
+          <option value="incluidos">{populationLabels.incluidos}</option><option value="todos">{populationLabels.todos}</option>
+        </select></label>
+        <label>Lunes de la semana ISO<input type="date" value={filters.semana_inicio}
+          onChange={event => changeFilters({ ...filters, semana_inicio: event.target.value })} /></label>
       </div>
-
-      <div className="fr04-summary">
-        <div className="fr04-stat"><small>Candidatos en el programa</small><strong>{summary ? formatter.format(summary.candidatos_programa) : '—'}</strong></div>
-        <div className="fr04-stat"><small>Fichas registradas</small><strong>{summary?.control_disponible ? formatter.format(summary.fichas_registradas) : '—'}</strong></div>
-        <div className="fr04-stat"><small>Fichas pendientes</small><strong>{summary?.control_disponible ? formatter.format(summary.fichas_pendientes) : '—'}</strong></div>
-        <div className="fr04-stat highlighted"><small>K4 · adherencia semanal</small><strong>{summary?.k4_tasa_adherencia == null ? '—' : `${summary.k4_tasa_adherencia.toFixed(1)} %`}</strong></div>
-      </div>
-      <p className="fr04-help">{summary?.estado_k4 === 'SIN_CONTROL'
-        ? 'La base contiene sesiones y participaciones. K4 requiere fichas semanales de vigencia y cobertura, que esta base todavía no contiene.'
-        : 'K4 se publica cuando todos los pacientes candidatos tienen ficha, la cobertura de los pacientes en intervención está confirmada y existe al menos un paciente en intervención.'}</p>
-
-      <div className="fr04-columns">
-        <section className="panel fr04-search-panel">
-          <div className="eyebrow">PACIENTE Y SEMANA</div><h2>Seleccionar paciente</h2>
-          <label>Código seudonimizado<input value={search} onChange={e => setSearch(e.target.value)} placeholder="Buscar por código" maxLength={60} /></label>
-          <div className="fr04-suggestions">{suggestions.map(item => <button key={item.codigo_paciente} className={selected === item.codigo_paciente ? 'selected' : ''} onClick={() => { setSelected(item.codigo_paciente); setSearch(item.codigo_paciente); setMessage('') }}>{item.codigo_paciente}</button>)}</div>
-          {loading && <p className="fr04-muted">Consultando sesiones…</p>}
-          {preview && <><div className="fr04-divider" /><div className="fr04-patient"><small>PACIENTE SELECCIONADO</small><strong>{preview.paciente.codigo_paciente}</strong><span>{preview.semana_inicio} al {preview.semana_fin}</span></div><div className="fr04-dose"><div><strong>{preview.dosis.sesiones_realizadas}</strong><span>sesiones realizadas</span></div><div><strong>{preview.dosis.minutos_realizados.toFixed(1)}</strong><span>minutos acumulados</span></div></div>{preview.dosis.horas_invalidas > 0 && <p className="fr04-warning">{preview.dosis.horas_invalidas} participación(es) sin duración válida.</p>}</>}
-        </section>
-
-        <section className="panel fr04-form-panel">
-          <div className="eyebrow">REGISTRO FR04</div><h2>{canEdit ? 'Confirmar vigencia y cobertura' : 'Vigencia y cobertura'}</h2>
-          {!preview ? <p className="fr04-placeholder">Selecciona un paciente para revisar su ficha semanal.</p> : <>
-            <div className="fr04-field"><span>Vigencia en la semana</span><div className="fr04-choice"><label><input type="radio" name="vigencia" disabled={!canEdit} checked={inIntervention === true} onChange={() => setInIntervention(true)} /> En intervención</label><label><input type="radio" name="vigencia" disabled={!canEdit} checked={inIntervention === false} onChange={() => { setInIntervention(false); setCoverage('') }} /> Fuera de intervención</label></div></div>
-            {inIntervention && <label className="fr04-field">Cobertura del registro<select disabled={!canEdit} value={coverage} onChange={e => setCoverage(e.target.value as Coverage | '')}><option value="">Seleccionar cobertura</option><option value="COMPLETA">Completa</option><option value="CERO_CONFIRMADO">Cero sesiones confirmado</option><option value="INSUFICIENTE">Insuficiente</option></select></label>}
-            <label className="fr04-field">{canEdit ? 'La ficha se guardará a nombre de' : 'Terapeuta responsable'}
-              <input readOnly value={canEdit ? `${user.codigo_personal} · ${user.nombre_completo}` : (preview.registro?.codigo_responsable ?? '—')} />
-            </label>
-            <label className="fr04-field">Observaciones<textarea readOnly={!canEdit} value={notes} onChange={e => setNotes(e.target.value)} maxLength={500} rows={3} placeholder={canEdit ? 'Fuente de la confirmación o incidencia de cobertura' : undefined} /></label>
-            <div className="fr04-save-row"><span>Clasificación: <strong>{preview.control_disponible ? preview.clasificacion.replaceAll('_', ' ').toLowerCase() : 'sin ficha en la base'}</strong></span>{canEdit && <button onClick={save} disabled={saving || inIntervention === null || (inIntervention && !coverage)}>{saving ? 'Guardando…' : 'Guardar FR04'}</button>}</div>
-          </>}
-        </section>
-      </div>
-
-      {error && <div className="error-panel" role="alert">{error}</div>}
-      {message && <div className="fr04-success" role="status">{message}</div>}
-
-      {preview && <section className="panel fr04-session-panel"><div className="eyebrow">TRAZABILIDAD FR03</div><h2>Sesiones del paciente en la semana</h2>{preview.sesiones.length ? <div className="fr04-table-wrap"><table><thead><tr><th>Sesión</th><th>Fecha</th><th>Participación</th><th>Minutos</th></tr></thead><tbody>{preview.sesiones.map(item => <tr key={item.codigo_sesion}><td>{item.codigo_sesion}</td><td>{item.fecha_hora_inicio_sesion.slice(0, 16).replace('T', ' ')}</td><td>{item.estado_participacion}</td><td>{item.minutos_realizados == null ? '—' : item.minutos_realizados.toFixed(1)}</td></tr>)}</tbody></table></div> : <p className="fr04-placeholder">No hay sesiones registradas. Confirma «cero sesiones» únicamente si la ausencia fue verificada.</p>}</section>}
-      <footer>FR04 · Registro semanal sobre SQL Server transaccional · Sin ETL ni data mart</footer>
-    </div>
-  )
+      {!validWeek && <p className="operation-help" role="status">Selecciona un lunes para consultar la semana.</p>}
+      {summary.loading && <p className="operation-help" role="status">Consultando la adherencia semanal…</p>}
+      {summary.error && <p className="error-panel" role="alert">{summary.error}</p>}
+      {stats && <div className="fr04-summary">
+        <div className="fr04-stat highlighted"><small>K4 · adherencia semanal</small>
+          <strong>{stats.k4_tasa_adherencia === null ? '—' : decimal.format(stats.k4_tasa_adherencia) + ' %'}</strong></div>
+        <div className="fr04-stat"><small>En intervención</small><strong>{integer.format(stats.en_intervencion)}</strong></div>
+        <div className="fr04-stat"><small>Cumplen</small><strong>{integer.format(stats.cumple)}</strong></div>
+        <div className="fr04-stat"><small>No cumplen</small><strong>{integer.format(stats.no_cumple)}</strong></div>
+      </div>}
+      <p className="operation-help">La intervención abarca desde la primera hasta la última semana con sesiones realizadas. La dosis exige al menos tres sesiones y 30 minutos acumulados.</p>
+    </section>
+    {showPatientDetails && <section className="panel operation-stack">
+      <h2>Ficha por paciente</h2>
+      <label className="fr04-search">Código del paciente<input value={search} maxLength={120}
+        onChange={event => { setSearch(event.target.value); setSelected('') }} placeholder="Buscar por inicio del código" /></label>
+      {patients.error && <p className="error-panel" role="alert">{patients.error}</p>}
+      {patients.loading && <p className="operation-help" role="status">Buscando pacientes…</p>}
+      {patients.data?.length === 0 && <p className="operation-help">Sin pacientes que coincidan en esa semana.</p>}
+      <div className="fr04-suggestions">{patients.data?.map(item => <button type="button" key={item.codigo_paciente}
+        aria-pressed={selected === item.codigo_paciente} className={selected === item.codigo_paciente ? 'selected' : ''}
+        onClick={() => setSelected(item.codigo_paciente)}>{item.codigo_paciente}</button>)}</div>
+      {patient.error && <p className="error-panel" role="alert">{patient.error}</p>}
+      {patient.loading && <p className="operation-help" role="status">Consultando la ficha semanal…</p>}
+      {ficha && <>
+        <div className="operation-subheading"><h3>{ficha.paciente.codigo_paciente}</h3>
+          <span>{ficha.semana_inicio} a {ficha.semana_fin}</span></div>
+        <div className="fr04-dose">
+          <div><strong>{integer.format(ficha.dosis.sesiones_realizadas)}</strong><span>sesiones realizadas</span></div>
+          <div><strong>{decimal.format(ficha.dosis.minutos_realizados)}</strong><span>minutos acumulados</span></div>
+          <div><strong>{ficha.clasificacion === 'CUMPLE' ? 'Cumple' : 'No cumple'}</strong><span>dosis semanal</span></div>
+        </div>
+        {ficha.sesiones.length ? <div className="fr04-table-wrap fr04-session-panel"><table>
+          <thead><tr><th>Sesión</th><th>Fecha</th><th>Ingreso</th><th>Salida</th><th>Minutos</th></tr></thead>
+          <tbody>{ficha.sesiones.map(item => <tr key={item.codigo_sesion}><td>{item.codigo_sesion}</td>
+            <td>{displayDateTime(item.fecha_hora_inicio_sesion)}</td><td>{displayDateTime(item.fecha_hora_ingreso_paciente)}</td>
+            <td>{displayDateTime(item.fecha_hora_salida_paciente)}</td>
+            <td>{item.minutos_realizados == null ? '—' : decimal.format(item.minutos_realizados)}</td></tr>)}</tbody>
+        </table></div> : <p className="operation-help">Esta semana en intervención tuvo cero sesiones registradas.</p>}
+      </>}
+    </section>}
+  </div>
 }
